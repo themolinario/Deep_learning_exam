@@ -135,12 +135,14 @@ class GradioDemo:
                 seg_kwargs = {"grid_size": (grid_size, grid_size)}
             elif method == "kmeans":
                 seg_kwargs = {"n_clusters": n_clusters}
+            elif method == "sam":
+                seg_kwargs = {}  # SAM non ha parametri configurabili nell'interfaccia
             else:  # superpixel
                 seg_kwargs = {"n_segments": n_segments}
 
             # Esegui la ricerca nei segmenti
             results, mask = self.pipeline.search_in_segments(
-                temp_path, query, top_k=3, method=method, **seg_kwargs
+                temp_path, query, top_k=3, segmentation_method=method, **seg_kwargs
             )
 
             if not results:
@@ -218,6 +220,29 @@ class GradioDemo:
 
         except Exception as e:
             return f"❌ Errore durante l'indicizzazione: {str(e)}"
+
+    def evaluate_performance(self) -> str:
+        """Esegui valutazione delle performance del sistema."""
+        if not self.is_initialized:
+            return "❌ Sistema non inizializzato!"
+
+        try:
+            from src.pipelines.performance_evaluation import PerformanceEvaluator
+
+            evaluator = PerformanceEvaluator(self.config_path)
+
+            # Genera report completo
+            report_path = evaluator.generate_comprehensive_report()
+
+            return f"✅ Valutazione completata!\n📋 Report salvato in: {report_path}\n\n" \
+                   f"Il report include:\n" \
+                   f"• Metriche di ricerca semantica\n" \
+                   f"• Performance dei metodi di segmentazione\n" \
+                   f"• Qualità degli embedding CLIP\n" \
+                   f"• Grafici e raccomandazioni"
+
+        except Exception as e:
+            return f"❌ Errore durante la valutazione: {str(e)}"
 
     def create_interface(self) -> gr.Blocks:
         """Crea l'interfaccia Gradio."""
@@ -299,130 +324,138 @@ class GradioDemo:
                 gr.Markdown("### Carica un'immagine e cerca parti specifiche al suo interno")
 
                 with gr.Row():
-                    with gr.Column():
+                    with gr.Column(scale=1):
                         segment_image = gr.Image(
                             label="Carica Immagine",
                             type="pil",
-                            height=400
+                            height=300
                         )
 
                         segment_query = gr.Textbox(
-                            label="Cosa cerchi nell'immagine?",
-                            placeholder="es. 'cielo blu', 'albero', 'edificio'",
+                            label="Cosa stai cercando?",
+                            placeholder="es. 'volto di una persona', 'cielo blu', 'edificio'",
                             lines=2
                         )
 
-                        with gr.Row():
-                            segment_method = gr.Dropdown(
-                                choices=["grid", "kmeans", "superpixel"],
-                                value="grid",
-                                label="Metodo di Segmentazione"
-                            )
-
-                        with gr.Row():
-                            grid_size = gr.Slider(2, 8, 4, step=1, label="Griglia (solo per Grid)")
-                            n_clusters = gr.Slider(3, 15, 8, step=1, label="Cluster (solo per K-means)")
-                            n_segments = gr.Slider(50, 300, 100, step=10, label="Segmenti (solo per Superpixel)")
-
-                        segment_button = gr.Button("🔍 Cerca nei Segmenti", variant="primary")
-
-                    with gr.Column():
-                        segment_status = gr.Textbox(label="Stato", lines=2)
-                        segment_result = gr.Image(
-                            label="Risultato Segmentazione",
-                            type="pil",
-                            height=400
+                        segment_method = gr.Dropdown(
+                            choices=["grid", "kmeans", "superpixel", "sam"],
+                            value="grid",
+                            label="Metodo di Segmentazione",
+                            info="SAM fornisce la segmentazione più accurata ma richiede più tempo"
                         )
+
+                        with gr.Accordion("⚙️ Parametri Avanzati", open=False):
+                            grid_size = gr.Slider(2, 8, 4, step=1, label="Dimensione Griglia")
+                            n_clusters = gr.Slider(4, 16, 8, step=1, label="Numero Cluster K-means")
+                            n_segments = gr.Slider(50, 200, 100, step=10, label="Numero Superpixel")
+
+                        segment_button = gr.Button("🔍 Analizza Segmenti", variant="primary")
+
+                    with gr.Column(scale=2):
+                        segment_status = gr.Textbox(label="Stato", lines=2)
+                        segment_result = gr.Image(label="Risultati Segmentazione", height=400)
 
                 segment_button.click(
                     fn=self.search_segments,
-                    inputs=[segment_image, segment_query, segment_method, grid_size, n_clusters, n_segments],
+                    inputs=[segment_image, segment_query, segment_method,
+                           grid_size, n_clusters, n_segments],
                     outputs=[segment_status, segment_result]
                 )
 
             # Tab per l'indicizzazione
             with gr.Tab("📊 Indicizzazione"):
-                gr.Markdown("### Indicizza un dataset di immagini per la ricerca veloce")
+                gr.Markdown("### Aggiungi nuove immagini al database per la ricerca")
 
-                with gr.Row():
-                    with gr.Column():
-                        # Pre-compila il percorso del dataset di Naruto
-                        config = self.load_config()
-                        raw_data_path = config.get('dataset', {}).get('raw_data_path', 'data/raw/')
-                        default_path = os.path.join(raw_data_path, 'Anime-Naruto')
+                index_path = gr.Textbox(
+                    label="Percorso Directory Immagini",
+                    placeholder="es. data/raw/nuovo_dataset/",
+                    value="data/raw/Anime-Naruto/"
+                )
 
-                        data_path_input = gr.Textbox(
-                            label="Percorso Directory Immagini",
-                            value=default_path if os.path.exists(default_path) else "",
-                            placeholder="/path/to/your/images",
-                            lines=1
-                        )
-
-                        index_button = gr.Button("📊 Avvia Indicizzazione", variant="primary")
-
-                        gr.Markdown("""
-                        **Note:**
-                        - L'indicizzazione può richiedere tempo a seconda del numero di immagini
-                        - Formati supportati: JPG, JPEG, PNG, BMP, TIFF
-                        - Il sistema processerà tutte le sottodirectory
-                        - Il dataset Naruto viene auto-rilevato se presente
-                        """)
-
-                    with gr.Column():
-                        index_status = gr.Textbox(
-                            label="Stato Indicizzazione",
-                            lines=5
-                        )
+                index_button = gr.Button("📥 Indicizza Dataset", variant="primary")
+                index_status = gr.Textbox(label="Stato Indicizzazione", lines=4)
 
                 index_button.click(
                     fn=self.index_sample_data,
-                    inputs=data_path_input,
+                    inputs=index_path,
                     outputs=index_status
                 )
 
-            # Tab informazioni
-            with gr.Tab("ℹ️ Info"):
+            # Nuovo Tab per la valutazione delle performance
+            with gr.Tab("📈 Valutazione Performance"):
+                gr.Markdown("""
+                ### Valutazione quantitativa del sistema
+                
+                Questo strumento esegue una valutazione completa delle performance del sistema:
+                - **Accuratezza ricerca semantica**: Precision, Recall, F1-Score, MAP
+                - **Performance segmentazione**: Tempi di elaborazione, qualità dei segmenti
+                - **Qualità embedding**: Coerenza intra/inter-classe
+                """)
+
+                eval_button = gr.Button("🚀 Esegui Valutazione Completa", variant="primary", size="lg")
+                eval_status = gr.Textbox(
+                    label="Risultati Valutazione",
+                    lines=10,
+                    placeholder="I risultati della valutazione appariranno qui..."
+                )
+
+                eval_button.click(
+                    fn=self.evaluate_performance,
+                    outputs=eval_status
+                )
+
+            # Tab informazioni aggiornato
+            with gr.Tab("ℹ️ Informazioni"):
                 gr.Markdown("""
                 ## 🎯 CLIP Scene Search System
                 
-                ### Tecnologie utilizzate:
-                - **CLIP (Contrastive Language-Image Pre-training)**: Modello di OpenAI per comprensione multimodale
-                - **FAISS**: Libreria Facebook per ricerca vettoriale efficiente
-                - **Gradio**: Framework per interfacce demo interattive
-                - **Streamlit**: Framework per applicazioni web (interfaccia alternativa disponibile)
+                ### Caratteristiche Principali
                 
-                ### Funzionalità principali:
+                **🔍 Ricerca Semantica Avanzata**
+                - Utilizza il modello CLIP per comprendere il contenuto delle immagini
+                - Ricerca tramite descrizioni in linguaggio naturale
+                - Database vettoriale FAISS per ricerche veloci
                 
-                #### 🔍 Ricerca Globale
-                - Ricerca semantica in collezioni di immagini
-                - Query in linguaggio naturale
-                - Ranking per similarità
+                **🧩 Segmentazione Multi-Metodo**
+                - **Grid**: Divisione uniforme dell'immagine in regioni
+                - **K-means**: Clustering basato sui colori
+                - **Superpixel**: Regioni semanticamente coerenti (SLIC)
+                - **SAM**: Segmentazione automatica avanzata (Segment Anything Model)
                 
-                #### 🧩 Ricerca Segmenti
-                - Segmentazione automatica delle immagini
-                - Ricerca in parti specifiche delle immagini
-                - Supporto per diversi algoritmi di segmentazione:
-                  - **Grid**: Divisione uniforme in griglia
-                  - **K-means**: Clustering basato sui colori
-                  - **Superpixel**: Regioni semanticamente omogenee
+                **📊 Valutazione Performance**
+                - Metriche quantitative di accuratezza
+                - Analisi comparative dei metodi di segmentazione
+                - Report dettagliati con visualizzazioni
                 
-                #### 📊 Indicizzazione
-                - Creazione di database vettoriali
-                - Elaborazione batch efficiente
-                - Supporto per grandi dataset
+                ### Obiettivi del Progetto ✅
                 
-                ### Come utilizzare:
-                1. **Inizializza** il sistema nel primo tab
-                2. **Indicizza** il tuo dataset (se necessario)
-                3. **Cerca** usando linguaggio naturale
-                4. **Esplora** i risultati e segmenti
+                ✅ **Dataset preprocessing**: Acquisizione e preprocessamento dataset caratteri  
+                ✅ **Indexing pipeline**: Creazione database vettoriale con embedding CLIP  
+                ✅ **Scene analysis**: Segmentazione immagini con multipli algoritmi (+SAM)  
+                ✅ **Matching algorithm**: Confronto embedding per identificazione caratteri  
+                ✅ **Interactive interface**: Interfaccia web Gradio completa  
+                ✅ **Performance evaluation**: Sistema di valutazione quantitativa e qualitativa  
                 
-                ### Esempi di query:
-                - "un tramonto arancione sul mare"
-                - "persone che camminano in città"
-                - "montagne innevate"
-                - "gatti che dormono"
-                - "architettura moderna"
+                ### Esempi di Query
+                
+                **Ricerca Globale:**
+                - "personaggio con capelli biondi"
+                - "ninja con fascia sulla fronte"
+                - "personaggio con occhi rossi"
+                - "scena di combattimento"
+                
+                **Ricerca Segmenti:**
+                - "volto del personaggio"
+                - "simbolo sulla fronte"
+                - "vestiti colorati"
+                - "sfondo naturale"
+                
+                ### Supporto Tecnico
+                
+                - **Modello**: CLIP ViT-B/32
+                - **Database**: FAISS IndexFlatIP
+                - **Segmentazione**: Grid, K-means, SLIC, SAM
+                - **Interfaccia**: Gradio con tema personalizzato
                 """)
 
         return demo

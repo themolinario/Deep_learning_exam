@@ -17,14 +17,81 @@ from tqdm import tqdm
 from src.models.backbones import CLIPBackbone
 from src.pipelines.index_dataset import DatasetIndexer
 
+# Import SAM se disponibile
+try:
+    from src.pipelines.sam_integration import SAMSegmenter
+    SAM_AVAILABLE = True
+except ImportError:
+    SAM_AVAILABLE = False
+    print("⚠️ SAM non disponibile. Installa con: pip install git+https://github.com/facebookresearch/segment-anything.git")
+
 
 class ImageSegmenter:
     """
-    Classe per la segmentazione delle immagini.
+    Classe per la segmentazione delle immagini con supporto per SAM.
     """
 
     def __init__(self, method="superpixel"):
         self.method = method
+        self.sam_segmenter = None
+
+        # Inizializza SAM se disponibile e richiesto
+        if method == "sam" and SAM_AVAILABLE:
+            try:
+                self.sam_segmenter = SAMSegmenter(device="cpu")
+            except Exception as e:
+                print(f"⚠️ Impossibile inizializzare SAM: {e}")
+                print("  Fallback a metodo superpixel")
+                self.method = "superpixel"
+
+    def segment(self, image, **kwargs):
+        """
+        Segmenta un'immagine usando il metodo specificato.
+
+        Args:
+            image: Immagine PIL o numpy array
+            **kwargs: Parametri specifici per ogni metodo
+
+        Returns:
+            Lista di segmenti con informazioni geometriche
+        """
+        if self.method == "sam" and self.sam_segmenter is not None:
+            return self.segment_sam(image, **kwargs)
+        elif self.method == "superpixel":
+            return self.segment_superpixel(image, **kwargs)
+        elif self.method == "kmeans":
+            return self.segment_kmeans_color(image, **kwargs)
+        elif self.method == "grid":
+            return self.segment_grid(image, **kwargs)
+        else:
+            raise ValueError(f"Metodo di segmentazione non supportato: {self.method}")
+
+    def segment_sam(self, image, **kwargs):
+        """
+        Segmentazione usando SAM (Segment Anything Model).
+
+        Args:
+            image: Immagine PIL o numpy array
+            **kwargs: Parametri SAM (ignorati per ora)
+
+        Returns:
+            Lista di segmenti
+        """
+        if self.sam_segmenter is None:
+            raise RuntimeError("SAM non inizializzato")
+
+        if isinstance(image, Image.Image):
+            image_np = np.array(image)
+        else:
+            image_np = image
+
+        # Genera maschere SAM
+        masks = self.sam_segmenter.segment_image(image_np)
+
+        # Converti in formato standard
+        segments = self.sam_segmenter.masks_to_segments(masks, image_np.shape[:2])
+
+        return segments
 
     def segment_superpixel(self, image, n_segments=100):
         """
@@ -35,7 +102,7 @@ class ImageSegmenter:
             n_segments: Numero di superpixel
 
         Returns:
-            Maschera di segmentazione
+            Lista di segmenti
         """
         if isinstance(image, Image.Image):
             image = np.array(image)
@@ -53,7 +120,9 @@ class ImageSegmenter:
         slic.iterate(10)
         mask = slic.getLabels()
 
-        return mask
+        # Converti in lista di segmenti
+        segments = self._mask_to_segments(mask, image.shape[:2])
+        return segments
 
     def segment_kmeans_color(self, image, n_clusters=8):
         """
@@ -64,7 +133,7 @@ class ImageSegmenter:
             n_clusters: Numero di cluster
 
         Returns:
-            Maschera di segmentazione
+            Lista di segmenti
         """
         if isinstance(image, Image.Image):
             image = np.array(image)
@@ -80,7 +149,9 @@ class ImageSegmenter:
         # Reshape back
         mask = labels.reshape(h, w)
 
-        return mask
+        # Converti in lista di segmenti
+        segments = self._mask_to_segments(mask, image.shape[:2])
+        return segments
 
     def segment_grid(self, image, grid_size=(4, 4)):
         """
@@ -91,7 +162,7 @@ class ImageSegmenter:
             grid_size: Dimensioni della griglia (rows, cols)
 
         Returns:
-            Maschera di segmentazione
+            Lista di segmenti
         """
         if isinstance(image, Image.Image):
             h, w = image.size[::-1]
@@ -99,44 +170,77 @@ class ImageSegmenter:
             h, w = image.shape[:2]
 
         rows, cols = grid_size
-        mask = np.zeros((h, w), dtype=int)
 
-        row_size = h // rows
-        col_size = w // cols
-
+        # Crea griglia
+        segments = []
         segment_id = 0
+
         for i in range(rows):
             for j in range(cols):
-                start_row = i * row_size
-                end_row = (i + 1) * row_size if i < rows - 1 else h
-                start_col = j * col_size
-                end_col = (j + 1) * col_size if j < cols - 1 else w
+                # Calcola coordinate del segmento
+                y1 = i * h // rows
+                y2 = (i + 1) * h // rows
+                x1 = j * w // cols
+                x2 = (j + 1) * w // cols
 
-                mask[start_row:end_row, start_col:end_col] = segment_id
+                # Crea maschera per questo segmento
+                mask = np.zeros((h, w), dtype=bool)
+                mask[y1:y2, x1:x2] = True
+
+                segment_info = {
+                    'id': segment_id,
+                    'mask': mask,
+                    'bbox': [x1, y1, x2, y2],
+                    'area': (x2 - x1) * (y2 - y1)
+                }
+
+                segments.append(segment_info)
                 segment_id += 1
 
-        return mask
+        return segments
 
-    def segment_image(self, image, **kwargs):
+    def _mask_to_segments(self, mask, image_shape):
         """
-        Segmenta un'immagine usando il metodo specificato.
+        Converte una maschera di segmentazione in lista di segmenti.
 
         Args:
-            image: Immagine da segmentare
-            **kwargs: Parametri specifici per il metodo
+            mask: Maschera con ID dei segmenti
+            image_shape: Dimensioni dell'immagine (H, W)
 
         Returns:
-            Maschera di segmentazione
+            Lista di segmenti con informazioni geometriche
         """
-        if self.method == "superpixel":
-            return self.segment_superpixel(image, **kwargs)
-        elif self.method == "kmeans":
-            return self.segment_kmeans_color(image, **kwargs)
-        elif self.method == "grid":
-            return self.segment_grid(image, **kwargs)
-        else:
-            raise ValueError(f"Metodo di segmentazione non supportato: {self.method}")
+        segments = []
+        unique_labels = np.unique(mask)
 
+        for label in unique_labels:
+            if label == -1:  # Skip background/noise
+                continue
+
+            # Crea maschera binaria per questo segmento
+            segment_mask = (mask == label)
+
+            # Trova bounding box
+            coords = np.where(segment_mask)
+            if len(coords[0]) == 0:
+                continue
+
+            y_min, y_max = coords[0].min(), coords[0].max()
+            x_min, x_max = coords[1].min(), coords[1].max()
+
+            # Calcola area
+            area = np.sum(segment_mask)
+
+            segment_info = {
+                'id': int(label),
+                'mask': segment_mask,
+                'bbox': [x_min, y_min, x_max, y_max],
+                'area': int(area)
+            }
+
+            segments.append(segment_info)
+
+        return segments
 
 class SemanticSearchPipeline:
     """
@@ -241,13 +345,44 @@ class SemanticSearchPipeline:
 
         # Segmenta l'immagine
         self.segmenter.method = segmentation_method
-        mask = self.segmenter.segment_image(image, **seg_kwargs)
+        segments = self.segmenter.segment(image, **seg_kwargs)
 
-        # Estrai feature dei segmenti
-        segment_features, segment_info = self.extract_segment_features(image, mask)
+        # Se il metodo non restituisce segmenti nel formato atteso, converti
+        if segments and isinstance(segments[0], dict) and 'bbox' in segments[0]:
+            # Formato già corretto con segmenti
+            segment_info = segments
+            # Crea una maschera dummy per compatibilità
+            mask = np.zeros((image.size[1], image.size[0]), dtype=int)
+        else:
+            # Formato legacy con maschera numerica - converti in segmenti
+            mask = segments if segments is not None else np.zeros((image.size[1], image.size[0]), dtype=int)
+            segment_info = self._convert_mask_to_segments(mask, image.size)
+
+        # Estrai feature dei segmenti usando il nuovo formato
+        segment_features = []
+        results = []
+
+        for i, seg_info in enumerate(segment_info):
+            try:
+                bbox = seg_info['bbox']
+                x1, y1, x2, y2 = bbox
+
+                # Estrai il segmento dell'immagine
+                segment_image = image.crop((x1, y1, x2, y2))
+
+                # Estrai feature con CLIP
+                preprocessed = self.clip_model.preprocess(segment_image).unsqueeze(0)
+                with torch.no_grad():
+                    features = self.clip_model.encode_image(preprocessed.to(self.clip_model.device))
+
+                segment_features.append(features.cpu().numpy())
+
+            except Exception as e:
+                print(f"Errore nell'estrazione delle feature per il segmento {i}: {e}")
+                continue
 
         if not segment_features:
-            return []
+            return [], mask
 
         # Estrai feature della query
         query_features = self.clip_model.encode_text([query_text])
@@ -265,94 +400,59 @@ class SemanticSearchPipeline:
         # Prepara i risultati
         results = []
         for i, idx in enumerate(sorted_indices):
-            result = {
-                'rank': i + 1,
-                'similarity': float(similarities[idx]),
-                'segment_info': segment_info[idx],
-                'features': segment_features[idx]
-            }
-            results.append(result)
+            if idx < len(segment_info):
+                result = {
+                    'rank': i + 1,
+                    'similarity': float(similarities[idx]),
+                    'segment_info': segment_info[idx],
+                    'features': segment_features[idx]
+                }
+                results.append(result)
 
         return results, mask
 
-    def visualize_search_results(self, image_path, results, mask,
-                                output_path=None, show_plot=True):
+    def _convert_mask_to_segments(self, mask, image_size):
         """
-        Visualizza i risultati della ricerca sui segmenti.
+        Converte una maschera numerica in lista di segmenti.
 
         Args:
-            image_path: Percorso dell'immagine originale
-            results: Risultati della ricerca
-            mask: Maschera di segmentazione
-            output_path: Percorso per salvare l'immagine (opzionale)
-            show_plot: Se mostrare il plot
-        """
-        # Carica l'immagine
-        image = Image.open(image_path)
-
-        # Crea il plot
-        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-
-        # Immagine originale
-        axes[0].imshow(image)
-        axes[0].set_title("Immagine Originale")
-        axes[0].axis('off')
-
-        # Immagine con risultati
-        axes[1].imshow(image)
-        axes[1].set_title("Segmenti Trovati")
-        axes[1].axis('off')
-
-        # Disegna i bounding box dei risultati
-        colors = plt.cm.Set3(np.linspace(0, 1, len(results)))
-
-        for i, (result, color) in enumerate(zip(results, colors)):
-            bbox = result['segment_info']['bbox']
-            x, y, x2, y2 = bbox
-
-            # Disegna il rettangolo
-            rect = patches.Rectangle((x, y), x2-x, y2-y,
-                                   linewidth=3, edgecolor=color,
-                                   facecolor='none', alpha=0.8)
-            axes[1].add_patch(rect)
-
-            # Aggiungi etichetta
-            axes[1].text(x, y-5, f"#{i+1}\n{result['similarity']:.3f}",
-                        fontsize=10, color=color, fontweight='bold',
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
-
-        plt.tight_layout()
-
-        if output_path:
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"Risultati salvati in: {output_path}")
-
-        if show_plot:
-            plt.show()
-        else:
-            plt.close()
-
-    def batch_search_scenes(self, query_text, image_directory=None, top_k=10):
-        """
-        Cerca scene simili in tutto il dataset.
-
-        Args:
-            query_text: Testo della query
-            image_directory: Directory delle immagini (opzionale)
-            top_k: Numero di risultati
+            mask: Maschera con ID dei segmenti
+            image_size: Dimensioni dell'immagine (W, H)
 
         Returns:
-            Lista di risultati
+            Lista di segmenti con informazioni geometriche
         """
-        if self.indexer.index.ntotal == 0:
-            print("Database vettoriale vuoto! Esegui prima l'indicizzazione.")
-            return []
+        segments = []
+        unique_labels = np.unique(mask)
 
-        # Cerca nel database vettoriale
-        results = self.indexer.search_similar_images(query_text, top_k)
+        for label in unique_labels:
+            if label == -1 or label == 0:  # Skip background/noise
+                continue
 
-        return results
+            # Crea maschera binaria per questo segmento
+            segment_mask = (mask == label)
 
+            # Trova bounding box
+            coords = np.where(segment_mask)
+            if len(coords[0]) == 0:
+                continue
+
+            y_min, y_max = coords[0].min(), coords[0].max()
+            x_min, x_max = coords[1].min(), coords[1].max()
+
+            # Calcola area
+            area = np.sum(segment_mask)
+
+            segment_info = {
+                'id': int(label),
+                'mask': segment_mask,
+                'bbox': [x_min, y_min, x_max, y_max],
+                'area': int(area)
+            }
+
+            segments.append(segment_info)
+
+        return segments
 
 def main():
     """

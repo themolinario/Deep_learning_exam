@@ -7,6 +7,7 @@ numpy>=1.21.0
 pandas>=1.5.0
 pillow>=9.0.0
 opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0  # Per SLIC superpixel
 matplotlib>=3.5.0
 seaborn>=0.11.0
 tqdm>=4.64.0
@@ -20,8 +21,19 @@ faiss-cpu>=1.7.4
 # UI
 gradio>=3.35.0
 
+# SAM (Segment Anything Model) - Optional
+# git+https://github.com/facebookresearch/segment-anything.git
+
+# Performance evaluation and visualization
+plotly>=5.0.0
+scipy>=1.9.0
+
 # Development
 jupyter>=1.0.0
 pytest>=7.0.0
 black>=23.0.0
 flake8>=6.0.0
+
+# Additional utilities
+requests>=2.28.0
+urllib3>=1.26.0
