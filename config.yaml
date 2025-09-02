@@ -1,0 +1,36 @@
+# Configurazione del progetto
+project:
+  name: "PythonProject"
+  version: "1.0.0"
+
+# Modello CLIP
+clip:
+  model_name: "ViT-B/32"
+  device: "cuda"  # cpu, cuda
+  batch_size: 32
+  learning_rate: 1e-5
+  epochs: 10
+
+# Dataset
+dataset:
+  raw_data_path: "data/raw/"
+  scene_examples_path: "data/scene_examples/"
+  image_size: 224
+  train_split: 0.8
+  val_split: 0.2
+
+# Vector Database
+vector_db:
+  path: "data/vector_db/"
+  embedding_dim: 512
+  similarity_threshold: 0.7
+
+# Checkpoints
+checkpoints:
+  save_path: "checkpoints/"
+  save_frequency: 5  # ogni 5 epoche
+
+# UI
+ui:
+  title: "CLIP Scene Search"
+  max_upload_size: 10  # MB
