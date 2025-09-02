@@ -198,7 +198,7 @@ class StreamlitApp:
 
             # Mostra l'immagine caricata
             image = Image.open(temp_path)
-            st.image(image, caption="Immagine caricata", use_column_width=True)
+            st.image(image, caption="Immagine caricata", use_container_width=True)
 
             # Parametri di segmentazione
             st.subheader("⚙️ Parametri di Segmentazione")
@@ -332,7 +332,7 @@ class StreamlitApp:
                     try:
                         with cols[i % 3]:
                             image = Image.open(img_path)
-                            st.image(image, caption=os.path.basename(img_path), use_column_width=True)
+                            st.image(image, caption=os.path.basename(img_path), use_container_width=True)
                     except Exception as e:
                         st.error(f"Errore nel caricamento di {img_path}: {e}")
 

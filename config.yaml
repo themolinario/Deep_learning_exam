@@ -6,8 +6,8 @@ project:
 # Modello CLIP
 clip:
   model_name: "ViT-B/32"
-  device: "cuda"  # cpu, cuda
-  batch_size: 32
+  device: "cpu"  # cpu è più stabile per la configurazione iniziale
+  batch_size: 16  # Ridotto per migliori performance su CPU
   learning_rate: 1e-5
   epochs: 10
 
