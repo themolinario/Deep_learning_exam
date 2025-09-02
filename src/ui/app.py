@@ -75,8 +75,16 @@ class StreamlitApp:
             "⚙️ Configurazione": "config"
         }
 
-        selected_page = st.sidebar.selectbox("Navigazione", list(pages.keys()))
-        return pages[selected_page]
+        # Inizializza la pagina corrente se non esiste
+        if 'current_page' not in st.session_state:
+            st.session_state.current_page = "home"
+
+        # Crea i pulsanti per la navigazione
+        for label, page_key in pages.items():
+            if st.sidebar.button(label, key=f"nav_{page_key}", use_container_width=True):
+                st.session_state.current_page = page_key
+
+        return st.session_state.current_page
 
     def home_page(self):
         """Pagina principale."""
