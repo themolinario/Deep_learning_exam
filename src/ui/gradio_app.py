@@ -7,7 +7,6 @@ import gradio as gr
 import os
 import sys
 import yaml
-import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -53,11 +52,33 @@ class GradioDemo:
             try:
                 self.indexer.load_index()
                 total_images = self.indexer.index.ntotal if self.indexer.index else 0
-                self.is_initialized = True
-                return f"✅ Sistema inizializzato! Database con {total_images} immagini caricato."
+                if total_images > 0:
+                    self.is_initialized = True
+                    return f"✅ Sistema inizializzato! Database con {total_images} immagini caricato."
+                else:
+                    raise Exception("Database vuoto")
             except:
-                self.is_initialized = True
-                return "✅ Sistema inizializzato! ⚠️ Nessun database trovato - esegui prima l'indicizzazione."
+                # Se non esiste un database, prova ad auto-indicizzare il dataset di Naruto
+                config = self.load_config()
+                raw_data_path = config.get('dataset', {}).get('raw_data_path', 'data/raw/')
+                naruto_path = os.path.join(raw_data_path, 'Anime-Naruto')
+
+                if os.path.exists(naruto_path):
+                    try:
+                        # Auto-indicizza il dataset di Naruto
+                        self.indexer.index_dataset(naruto_path)
+
+                        # Ricarica l'indice dopo l'indicizzazione
+                        self.indexer.load_index()
+                        total_images = self.indexer.index.ntotal if self.indexer.index else 0
+                        self.is_initialized = True
+                        return f"✅ Sistema inizializzato! Dataset Naruto auto-indicizzato con {total_images} immagini."
+                    except Exception as e:
+                        self.is_initialized = True
+                        return f"✅ Sistema inizializzato! ⚠️ Errore nell'auto-indicizzazione: {str(e)}"
+                else:
+                    self.is_initialized = True
+                    return "✅ Sistema inizializzato! ⚠️ Nessun dataset trovato - carica manualmente nella tab Indicizzazione."
 
         except Exception as e:
             return f"❌ Errore nell'inizializzazione: {str(e)}"
@@ -325,8 +346,14 @@ class GradioDemo:
 
                 with gr.Row():
                     with gr.Column():
+                        # Pre-compila il percorso del dataset di Naruto
+                        config = self.load_config()
+                        raw_data_path = config.get('dataset', {}).get('raw_data_path', 'data/raw/')
+                        default_path = os.path.join(raw_data_path, 'Anime-Naruto')
+
                         data_path_input = gr.Textbox(
                             label="Percorso Directory Immagini",
+                            value=default_path if os.path.exists(default_path) else "",
                             placeholder="/path/to/your/images",
                             lines=1
                         )
@@ -338,6 +365,7 @@ class GradioDemo:
                         - L'indicizzazione può richiedere tempo a seconda del numero di immagini
                         - Formati supportati: JPG, JPEG, PNG, BMP, TIFF
                         - Il sistema processerà tutte le sottodirectory
+                        - Il dataset Naruto viene auto-rilevato se presente
                         """)
 
                     with gr.Column():
