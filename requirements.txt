@@ -18,7 +18,6 @@ faiss-cpu>=1.7.4
 # chromadb>=0.4.0  # Commented out as it may cause conflicts
 
 # UI
-streamlit>=1.25.0
 gradio>=3.35.0
 
 # Development
