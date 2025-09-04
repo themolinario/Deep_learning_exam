@@ -1,247 +1,407 @@
 """
-Pipeline per l'indicizzazione del dataset e la creazione del database vettoriale.
+Pipeline per l'indicizzazione del dataset e creazione del vector database.
 """
 
 import os
-import numpy as np
-import torch
-from PIL import Image
-import yaml
-import pickle
-import faiss
-from tqdm import tqdm
 import json
+import numpy as np
+from PIL import Image
+import torch
+from typing import List, Dict, Any, Tuple
+from pathlib import Path
+import pickle
+from tqdm import tqdm
 
-from src.models.backbones import CLIPBackbone
+try:
+    import faiss
+except ImportError:
+    print("⚠️ FAISS non installato. Installa con: pip install faiss-cpu")
+    faiss = None
+
+try:
+    from transformers import CLIPProcessor, CLIPModel
+except ImportError:
+    print("⚠️ Transformers non installato. Installa con: pip install transformers")
+    CLIPProcessor = None
+    CLIPModel = None
 
 
 class DatasetIndexer:
     """
-    Classe per l'indicizzazione del dataset e la creazione del database vettoriale.
+    Classe per indicizzare il dataset e creare il vector database.
     """
 
-    def __init__(self, config_path="config.yaml"):
-        # Carica la configurazione
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Inizializza l'indicizzatore del dataset.
 
-        self.device = torch.device(self.config['clip']['device'] if torch.cuda.is_available() else 'cpu')
+        Args:
+            config: Configurazione del progetto
+        """
+        self.config = config
+        self.device = config.get('models', {}).get('clip', {}).get('device', 'cpu')
 
         # Inizializza il modello CLIP
-        self.model = CLIPBackbone(
-            model_name=self.config['clip']['model_name'],
-            device=self.device
-        )
+        model_name = config.get('models', {}).get('clip', {}).get('model_name', 'openai/clip-vit-base-patch32')
 
-        # Parametri del database vettoriale
-        self.vector_db_path = self.config['vector_db']['path']
-        self.embedding_dim = self.config['vector_db']['embedding_dim']
+        if CLIPModel is None or CLIPProcessor is None:
+            raise ImportError("Transformers non installato. Installa con: pip install transformers")
 
-        # Inizializza l'indice FAISS
-        self.index = faiss.IndexFlatIP(self.embedding_dim)  # Inner Product per similarità coseno
+        self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=True)
+        self.model = CLIPModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
 
-        # Metadata delle immagini
-        self.image_metadata = []
+        # Configurazione vector database
+        self.embedding_dim = config.get('vector_db', {}).get('embedding_dim', 512)
+        self.vector_db_path = config.get('vector_db', {}).get('index_path', 'data/vector_db/image_index.faiss')
+        self.metadata_path = config.get('vector_db', {}).get('metadata_path', 'data/vector_db/image_metadata.json')
 
-    def load_images_from_directory(self, directory_path):
+        # Database vettoriale
+        self.index = None
+        self.metadata = []
+
+    def load_dataset(self, dataset_path: str) -> List[Dict[str, Any]]:
         """
-        Carica tutte le immagini da una directory.
+        Carica il dataset organizzato per personaggi.
 
         Args:
-            directory_path: Percorso della directory contenente le immagini
+            dataset_path: Percorso della directory del dataset
 
         Returns:
-            Lista di percorsi delle immagini
+            Lista di dizionari con informazioni delle immagini
         """
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        image_paths = []
+        dataset = []
+        dataset_path = Path(dataset_path)
 
-        for root, dirs, files in os.walk(directory_path):
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in image_extensions):
-                    image_paths.append(os.path.join(root, file))
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset non trovato: {dataset_path}")
 
-        return image_paths
+        # Estensioni immagine supportate
+        image_extensions = self.config.get('dataset', {}).get('image_extensions', ['.jpg', '.jpeg', '.png'])
 
-    def extract_image_features(self, image_paths, batch_size=32):
+        # Attraversa le directory del dataset
+        for split_dir in ['train', 'valid', 'test']:
+            split_path = dataset_path / split_dir
+            if not split_path.exists():
+                continue
+
+            print(f"Caricamento split: {split_dir}")
+
+            # Cerca file di classe (_classes.csv) se presente
+            classes_file = split_path / '_classes.csv'
+            if classes_file.exists():
+                print(f"Caricamento CSV: {classes_file}")
+                # Carica le classi dal file CSV multi-label
+                with open(classes_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) < 2:
+                        continue
+
+                    # Leggi header per ottenere i nomi dei personaggi
+                    header = lines[0].strip().split(',')
+                    character_columns = header[1:]  # Escludi la colonna filename
+                    print(f"Personaggi trovati: {character_columns}")
+
+                    # Processa ogni riga di dati
+                    for line in lines[1:]:  # Salta header
+                        parts = line.strip().split(',')
+                        if len(parts) < len(header):
+                            continue
+
+                        filename = parts[0]
+                        labels = [int(x) for x in parts[1:]]
+
+                        # Trova quale personaggio è presente (valore 1)
+                        characters_present = []
+                        for i, label in enumerate(labels):
+                            if label == 1:
+                                characters_present.append(character_columns[i])
+
+                        # Se nessun personaggio è etichettato o è "Unlabeled", salta
+                        if not characters_present or (len(characters_present) == 1 and characters_present[0] == 'Unlabeled'):
+                            continue
+
+                        # Usa il primo personaggio se ce ne sono multipli
+                        character = characters_present[0]
+
+                        # Costruisci il percorso completo
+                        image_path = split_path / filename
+                        if image_path.exists() and image_path.suffix.lower() in image_extensions:
+                            dataset.append({
+                                'path': str(image_path),
+                                'character': character,
+                                'split': split_dir
+                            })
+                            print(f"Aggiunto: {filename} -> {character}")
+                        else:
+                            print(f"⚠️ File non trovato: {image_path}")
+            else:
+                # Se non c'è file CSV, usa la struttura delle directory
+                for character_dir in split_path.iterdir():
+                    if character_dir.is_dir():
+                        character_name = character_dir.name
+
+                        for image_file in character_dir.iterdir():
+                            if image_file.suffix.lower() in image_extensions:
+                                dataset.append({
+                                    'path': str(image_file),
+                                    'character': character_name,
+                                    'split': split_dir
+                                })
+
+                # Se non ci sono sottodirectory, tutte le immagini sono nella directory split
+                if not any(child.is_dir() for child in split_path.iterdir()):
+                    for image_file in split_path.iterdir():
+                        if image_file.suffix.lower() in image_extensions:
+                            # Estrai il nome del personaggio dal nome del file
+                            character_name = self._extract_character_from_filename(image_file.name)
+                            dataset.append({
+                                'path': str(image_file),
+                                'character': character_name,
+                                'split': split_dir
+                            })
+
+        print(f"Caricato dataset con {len(dataset)} immagini")
+        return dataset
+
+    def _extract_character_from_filename(self, filename: str) -> str:
         """
-        Estrae le feature dalle immagini usando CLIP.
+        Estrae il nome del personaggio dal nome del file.
 
         Args:
-            image_paths: Lista dei percorsi delle immagini
-            batch_size: Dimensione del batch per l'elaborazione
+            filename: Nome del file
 
         Returns:
-            Array numpy delle feature estratte
+            Nome del personaggio estratto
         """
-        features = []
+        # Rimuovi estensione
+        name = Path(filename).stem
 
-        for i in tqdm(range(0, len(image_paths), batch_size), desc="Estraendo feature"):
-            batch_paths = image_paths[i:i + batch_size]
-            batch_images = []
+        # Logica per estrarre il personaggio dal nome del file
+        # Questo dipende dalla convenzione di nomenclatura del dataset
 
-            # Preprocessa le immagini del batch
-            for path in batch_paths:
+        # Se il nome contiene underscore, prendi la prima parte
+        if '_' in name:
+            return name.split('_')[0]
+
+        # Se contiene trattini, prendi la prima parte
+        if '-' in name:
+            return name.split('-')[0]
+
+        # Altrimenti usa tutto il nome
+        return name
+
+    def compute_embeddings(self, dataset: List[Dict[str, Any]]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        """
+        Calcola gli embedding per tutte le immagini del dataset.
+
+        Args:
+            dataset: Lista di informazioni delle immagini
+
+        Returns:
+            Tupla con array degli embedding e metadati aggiornati
+        """
+        embeddings = []
+        metadata = []
+
+        print("Calcolo embedding delle immagini...")
+
+        with torch.no_grad():
+            for item in tqdm(dataset, desc="Embedding"):
                 try:
-                    image = Image.open(path).convert('RGB')
-                    image = self.model.preprocess(image).unsqueeze(0)
-                    batch_images.append(image)
+                    # Carica l'immagine
+                    image = Image.open(item['path']).convert('RGB')
+
+                    # Preprocessa l'immagine
+                    inputs = self.processor(images=image, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                    # Calcola l'embedding
+                    image_features = self.model.get_image_features(**inputs)
+
+                    # Normalizza l'embedding
+                    image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+
+                    # Converti in numpy
+                    embedding = image_features.cpu().numpy().flatten()
+
+                    embeddings.append(embedding)
+                    metadata.append({
+                        'path': item['path'],
+                        'character': item['character'],
+                        'split': item['split'],
+                        'embedding_id': len(metadata)
+                    })
+
                 except Exception as e:
-                    print(f"Errore nel caricare {path}: {e}")
+                    print(f"Errore processando {item['path']}: {e}")
                     continue
 
-            if batch_images:
-                # Combina le immagini in un batch
-                batch_tensor = torch.cat(batch_images).to(self.device)
+        embeddings_array = np.vstack(embeddings).astype(np.float32)
+        print(f"Calcolati {len(embeddings_array)} embedding di dimensione {embeddings_array.shape[1]}")
 
-                # Estrai le feature
-                with torch.no_grad():
-                    batch_features = self.model.encode_image(batch_tensor)
-                    features.append(batch_features.cpu().numpy())
+        return embeddings_array, metadata
 
-        return np.vstack(features) if features else np.array([])
-
-    def index_dataset(self, data_directory=None):
+    def create_vector_index(self, embeddings: np.ndarray, use_faiss: bool = True) -> Any:
         """
-        Indicizza tutto il dataset e crea il database vettoriale.
+        Crea l'indice vettoriale per la ricerca veloce.
 
         Args:
-            data_directory: Directory contenente le immagini (se None, usa la config)
-        """
-        if data_directory is None:
-            data_directory = self.config['dataset']['raw_data_path']
-
-        print(f"Indicizzazione del dataset da: {data_directory}")
-
-        # Carica i percorsi delle immagini
-        image_paths = self.load_images_from_directory(data_directory)
-        print(f"Trovate {len(image_paths)} immagini")
-
-        if not image_paths:
-            print("Nessuna immagine trovata!")
-            return
-
-        # Estrai le feature
-        features = self.extract_image_features(image_paths)
-
-        if features.size == 0:
-            print("Nessuna feature estratta!")
-            return
-
-        # Normalizza le feature per la similarità coseno
-        features = features / np.linalg.norm(features, axis=1, keepdims=True)
-
-        # Aggiungi le feature all'indice FAISS
-        self.index.add(features.astype('float32'))
-
-        # Salva i metadata delle immagini
-        for i, path in enumerate(image_paths):
-            metadata = {
-                'id': i,
-                'path': path,
-                'filename': os.path.basename(path),
-                'directory': os.path.dirname(path)
-            }
-            self.image_metadata.append(metadata)
-
-        # Salva l'indice e i metadata
-        self.save_index()
-
-        print(f"Indicizzazione completata! {len(image_paths)} immagini indicizzate.")
-
-    def save_index(self):
-        """
-        Salva l'indice FAISS e i metadata su disco.
-        """
-        os.makedirs(self.vector_db_path, exist_ok=True)
-
-        # Salva l'indice FAISS
-        index_path = os.path.join(self.vector_db_path, "image_index.faiss")
-        faiss.write_index(self.index, index_path)
-
-        # Salva i metadata
-        metadata_path = os.path.join(self.vector_db_path, "image_metadata.json")
-        with open(metadata_path, 'w') as f:
-            json.dump(self.image_metadata, f, indent=2)
-
-        print(f"Indice salvato in: {index_path}")
-        print(f"Metadata salvati in: {metadata_path}")
-
-    def load_index(self):
-        """
-        Carica l'indice FAISS e i metadata da disco.
-        """
-        index_path = os.path.join(self.vector_db_path, "image_index.faiss")
-        metadata_path = os.path.join(self.vector_db_path, "image_metadata.json")
-
-        if os.path.exists(index_path) and os.path.exists(metadata_path):
-            # Carica l'indice FAISS
-            self.index = faiss.read_index(index_path)
-
-            # Carica i metadata
-            with open(metadata_path, 'r') as f:
-                self.image_metadata = json.load(f)
-
-            print(f"Indice caricato: {self.index.ntotal} immagini")
-            return True
-        else:
-            print("Indice non trovato!")
-            return False
-
-    def search_similar_images(self, query_text, top_k=10):
-        """
-        Cerca immagini simili basandosi su una query testuale.
-
-        Args:
-            query_text: Testo della query
-            top_k: Numero di risultati da restituire
+            embeddings: Array degli embedding
+            use_faiss: Se usare FAISS per l'indicizzazione
 
         Returns:
-            Lista di risultati con score e metadata
+            Indice vettoriale creato
         """
-        if self.index.ntotal == 0:
-            print("Indice vuoto! Esegui prima l'indicizzazione.")
-            return []
+        if use_faiss and faiss is not None:
+            print("Creazione indice FAISS...")
 
-        # Estrai le feature del testo
-        text_features = self.model.encode_text([query_text])
-        text_features = text_features.cpu().numpy()
-        text_features = text_features / np.linalg.norm(text_features, axis=1, keepdims=True)
+            # Crea indice FAISS per similarità coseno
+            index = faiss.IndexFlatIP(embeddings.shape[1])  # Inner Product per cosine similarity
 
-        # Cerca nell'indice
-        similarities, indices = self.index.search(text_features.astype('float32'), top_k)
+            # Normalizza gli embedding per la similarità coseno
+            faiss.normalize_L2(embeddings)
 
-        # Prepara i risultati
-        results = []
-        for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
-            if idx < len(self.image_metadata):
-                result = {
-                    'rank': i + 1,
-                    'similarity': float(similarity),
-                    'metadata': self.image_metadata[idx]
-                }
-                results.append(result)
+            # Aggiungi embedding all'indice
+            index.add(embeddings)
 
-        return results
+            print(f"Indice FAISS creato con {index.ntotal} vettori")
+            return index
+        else:
+            print("Usando ricerca lineare semplice...")
+            # Fallback a ricerca lineare
+            return embeddings
+
+    def save_index(self, index: Any, metadata: List[Dict[str, Any]], use_faiss: bool = True):
+        """
+        Salva l'indice vettoriale e i metadati su disco.
+
+        Args:
+            index: Indice vettoriale
+            metadata: Metadati delle immagini
+            use_faiss: Se l'indice è FAISS
+        """
+        # Crea directory se non esiste
+        os.makedirs(os.path.dirname(self.vector_db_path), exist_ok=True)
+
+        if use_faiss and faiss is not None:
+            # Salva indice FAISS
+            faiss.write_index(index, self.vector_db_path)
+            print(f"Indice FAISS salvato in: {self.vector_db_path}")
+        else:
+            # Salva array numpy
+            np.save(self.vector_db_path.replace('.faiss', '.npy'), index)
+            print(f"Array embedding salvato in: {self.vector_db_path.replace('.faiss', '.npy')}")
+
+        # Salva metadati
+        with open(self.metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Metadati salvati in: {self.metadata_path}")
+
+    def load_index(self, use_faiss: bool = True) -> Tuple[Any, List[Dict[str, Any]]]:
+        """
+        Carica l'indice vettoriale e i metadati da disco.
+
+        Args:
+            use_faiss: Se l'indice è FAISS
+
+        Returns:
+            Tupla con indice e metadati
+        """
+        # Carica metadati
+        if not os.path.exists(self.metadata_path):
+            raise FileNotFoundError(f"File metadati non trovato: {self.metadata_path}")
+
+        with open(self.metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        # Carica indice
+        if use_faiss and faiss is not None and os.path.exists(self.vector_db_path):
+            index = faiss.read_index(self.vector_db_path)
+            print(f"Indice FAISS caricato: {index.ntotal} vettori")
+        else:
+            npy_path = self.vector_db_path.replace('.faiss', '.npy')
+            if os.path.exists(npy_path):
+                index = np.load(npy_path)
+                print(f"Array embedding caricato: {index.shape}")
+            else:
+                raise FileNotFoundError(f"Indice non trovato: {self.vector_db_path} o {npy_path}")
+
+        return index, metadata
+
+    def build_full_index(self, dataset_path: str, use_faiss: bool = True):
+        """
+        Costruisce l'indice completo dal dataset.
+
+        Args:
+            dataset_path: Percorso del dataset
+            use_faiss: Se usare FAISS
+        """
+        print("=== Inizio indicizzazione dataset ===")
+
+        # 1. Carica dataset
+        dataset = self.load_dataset(dataset_path)
+
+        # 2. Calcola embedding
+        embeddings, metadata = self.compute_embeddings(dataset)
+
+        # 3. Crea indice
+        index = self.create_vector_index(embeddings, use_faiss)
+
+        # 4. Salva indice e metadati
+        self.save_index(index, metadata, use_faiss)
+
+        # 5. Aggiorna attributi di classe
+        self.index = index
+        self.metadata = metadata
+
+        print("=== Indicizzazione completata ===")
+
+        # Statistiche finali
+        characters = set(item['character'] for item in metadata)
+        print(f"Personaggi nel database: {len(characters)}")
+        print(f"Immagini totali: {len(metadata)}")
+        print(f"Personaggi trovati: {sorted(characters)}")
 
 
-def main():
+class SimpleVectorDB:
     """
-    Funzione principale per eseguire l'indicizzazione.
+    Implementazione semplice di vector database per il fallback.
     """
-    indexer = DatasetIndexer()
 
-    # Indicizza il dataset
-    indexer.index_dataset()
+    def __init__(self):
+        self.embeddings = None
+        self.metadata = []
 
-    # Test di ricerca
-    print("\nTest di ricerca:")
-    results = indexer.search_similar_images("a beautiful landscape", top_k=5)
+    def add(self, embeddings: np.ndarray, metadata: List[Dict[str, Any]]):
+        """Aggiunge embedding al database."""
+        self.embeddings = embeddings
+        self.metadata = metadata
 
-    for result in results:
-        print(f"Rank {result['rank']}: {result['metadata']['filename']} "
-              f"(similarity: {result['similarity']:.3f})")
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Cerca i k embedding più simili.
 
+        Args:
+            query_embedding: Embedding di query
+            k: Numero di risultati da restituire
 
-if __name__ == "__main__":
-    main()
+        Returns:
+            Tupla con (scores, indices)
+        """
+        if self.embeddings is None:
+            return np.array([]), np.array([])
+
+        # Normalizza query
+        query_embedding = query_embedding / np.linalg.norm(query_embedding)
+
+        # Calcola similarità coseno
+        similarities = np.dot(self.embeddings, query_embedding)
+
+        # Trova i top-k
+        top_indices = np.argsort(similarities)[::-1][:k]
+        top_scores = similarities[top_indices]
+
+        return top_scores, top_indices
+

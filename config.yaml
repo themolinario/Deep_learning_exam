@@ -13,11 +13,11 @@ clip:
 
 # Dataset
 dataset:
-  raw_data_path: "data/raw/"
-  scene_examples_path: "data/scene_examples/"
-  image_size: 224
+  raw_data_path: "data/raw/Anime-Naruto"
   train_split: 0.8
-  val_split: 0.2
+  val_split: 0.1
+  test_split: 0.1
+  image_extensions: [".jpg", ".jpeg", ".png"]
 
 # Vector Database
 vector_db:
@@ -34,3 +34,57 @@ checkpoints:
 ui:
   title: "CLIP Scene Search"
   max_upload_size: 10  # MB
+
+# Model Configuration
+models:
+  clip:
+    model_name: "openai/clip-vit-base-patch32"
+    checkpoint_path: "checkpoints/clip_models/ViT-B-32.pt"
+    device: "cpu"  # or "cuda" if available
+
+  sam:
+    model_type: "vit_b"
+    checkpoint_path: "checkpoints/sam_vit_b_01ec64.pth"
+    device: "cpu"
+
+  alternative_model:
+    name: "dinov2"  # or "blip2"
+    model_path: "facebook/dinov2-base"
+
+# Training Configuration
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 10
+  temperature: 0.1
+  margin: 0.2
+  weight_decay: 0.0001
+  save_every: 2
+  checkpoint_dir: "checkpoints/fine_tuned"
+
+# Segmentation Configuration
+segmentation:
+  min_mask_area: 1000
+  points_per_side: 32
+  pred_iou_thresh: 0.86
+  stability_score_thresh: 0.92
+  crop_n_layers: 1
+  crop_n_points_downscale_factor: 2
+
+# Search Configuration
+search:
+  top_k: 5
+  similarity_threshold: 0.7
+
+# UI Configuration
+ui:
+  port: 7860
+  share: false
+  debug: true
+  max_image_size: 1024
+
+# Evaluation Configuration
+evaluation:
+  test_scenes_path: "data/test_scenes"
+  metrics: ["accuracy", "precision", "recall", "f1"]
+  output_dir: "reports"

@@ -1,472 +1,465 @@
 """
-Pipeline per la segmentazione delle immagini e la ricerca semantica.
+Pipeline per l'analisi delle scene che combina SAM per la segmentazione
+e CLIP per l'identificazione dei personaggi.
 """
 
 import os
 import numpy as np
+from PIL import Image
 import cv2
 import torch
-import yaml
+from typing import List, Dict, Any, Tuple, Optional
 import json
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from sklearn.cluster import KMeans
-from tqdm import tqdm
 
-from src.models.backbones import CLIPBackbone
-from src.pipelines.index_dataset import DatasetIndexer
-
-# Import SAM se disponibile
 try:
-    from src.pipelines.sam_integration import SAMSegmenter
-    SAM_AVAILABLE = True
+    from transformers import CLIPProcessor, CLIPModel
 except ImportError:
-    SAM_AVAILABLE = False
-    print("⚠️ SAM non disponibile. Installa con: pip install git+https://github.com/facebookresearch/segment-anything.git")
+    print("⚠️ Transformers non installato. Installa con: pip install transformers")
+    CLIPProcessor = None
+    CLIPModel = None
+
+try:
+    import faiss
+except ImportError:
+    print("⚠️ FAISS non installato. Installa con: pip install faiss-cpu")
+    faiss = None
+
+from .sam_integration import SAMSegmenter
+from .index_dataset import SimpleVectorDB
 
 
-class ImageSegmenter:
+class SceneAnalyzer:
     """
-    Classe per la segmentazione delle immagini con supporto per SAM.
-    """
-
-    def __init__(self, method="superpixel"):
-        self.method = method
-        self.sam_segmenter = None
-
-        # Inizializza SAM se disponibile e richiesto
-        if method == "sam" and SAM_AVAILABLE:
-            try:
-                self.sam_segmenter = SAMSegmenter(device="cpu")
-            except Exception as e:
-                print(f"⚠️ Impossibile inizializzare SAM: {e}")
-                print("  Fallback a metodo superpixel")
-                self.method = "superpixel"
-
-    def segment(self, image, **kwargs):
-        """
-        Segmenta un'immagine usando il metodo specificato.
-
-        Args:
-            image: Immagine PIL o numpy array
-            **kwargs: Parametri specifici per ogni metodo
-
-        Returns:
-            Lista di segmenti con informazioni geometriche
-        """
-        if self.method == "sam" and self.sam_segmenter is not None:
-            return self.segment_sam(image, **kwargs)
-        elif self.method == "superpixel":
-            return self.segment_superpixel(image, **kwargs)
-        elif self.method == "kmeans":
-            return self.segment_kmeans_color(image, **kwargs)
-        elif self.method == "grid":
-            return self.segment_grid(image, **kwargs)
-        else:
-            raise ValueError(f"Metodo di segmentazione non supportato: {self.method}")
-
-    def segment_sam(self, image, **kwargs):
-        """
-        Segmentazione usando SAM (Segment Anything Model).
-
-        Args:
-            image: Immagine PIL o numpy array
-            **kwargs: Parametri SAM (ignorati per ora)
-
-        Returns:
-            Lista di segmenti
-        """
-        if self.sam_segmenter is None:
-            raise RuntimeError("SAM non inizializzato")
-
-        if isinstance(image, Image.Image):
-            image_np = np.array(image)
-        else:
-            image_np = image
-
-        # Genera maschere SAM
-        masks = self.sam_segmenter.segment_image(image_np)
-
-        # Converti in formato standard
-        segments = self.sam_segmenter.masks_to_segments(masks, image_np.shape[:2])
-
-        return segments
-
-    def segment_superpixel(self, image, n_segments=100):
-        """
-        Segmentazione usando algoritmo SLIC superpixel.
-
-        Args:
-            image: Immagine PIL o numpy array
-            n_segments: Numero di superpixel
-
-        Returns:
-            Lista di segmenti
-        """
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        # Converte in formato OpenCV
-        if len(image.shape) == 3:
-            image_cv = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-        else:
-            image_cv = image
-
-        # Applica SLIC
-        slic = cv2.ximgproc.createSuperpixelSLIC(image_cv,
-                                                 cv2.ximgproc.SLIC,
-                                                 n_segments)
-        slic.iterate(10)
-        mask = slic.getLabels()
-
-        # Converti in lista di segmenti
-        segments = self._mask_to_segments(mask, image.shape[:2])
-        return segments
-
-    def segment_kmeans_color(self, image, n_clusters=8):
-        """
-        Segmentazione basata su clustering dei colori.
-
-        Args:
-            image: Immagine PIL o numpy array
-            n_clusters: Numero di cluster
-
-        Returns:
-            Lista di segmenti
-        """
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        # Reshape per clustering
-        h, w, c = image.shape
-        image_flat = image.reshape(-1, c)
-
-        # K-means clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        labels = kmeans.fit_predict(image_flat)
-
-        # Reshape back
-        mask = labels.reshape(h, w)
-
-        # Converti in lista di segmenti
-        segments = self._mask_to_segments(mask, image.shape[:2])
-        return segments
-
-    def segment_grid(self, image, grid_size=(4, 4)):
-        """
-        Segmentazione a griglia uniforme.
-
-        Args:
-            image: Immagine PIL o numpy array
-            grid_size: Dimensioni della griglia (rows, cols)
-
-        Returns:
-            Lista di segmenti
-        """
-        if isinstance(image, Image.Image):
-            h, w = image.size[::-1]
-        else:
-            h, w = image.shape[:2]
-
-        rows, cols = grid_size
-
-        # Crea griglia
-        segments = []
-        segment_id = 0
-
-        for i in range(rows):
-            for j in range(cols):
-                # Calcola coordinate del segmento
-                y1 = i * h // rows
-                y2 = (i + 1) * h // rows
-                x1 = j * w // cols
-                x2 = (j + 1) * w // cols
-
-                # Crea maschera per questo segmento
-                mask = np.zeros((h, w), dtype=bool)
-                mask[y1:y2, x1:x2] = True
-
-                segment_info = {
-                    'id': segment_id,
-                    'mask': mask,
-                    'bbox': [x1, y1, x2, y2],
-                    'area': (x2 - x1) * (y2 - y1)
-                }
-
-                segments.append(segment_info)
-                segment_id += 1
-
-        return segments
-
-    def _mask_to_segments(self, mask, image_shape):
-        """
-        Converte una maschera di segmentazione in lista di segmenti.
-
-        Args:
-            mask: Maschera con ID dei segmenti
-            image_shape: Dimensioni dell'immagine (H, W)
-
-        Returns:
-            Lista di segmenti con informazioni geometriche
-        """
-        segments = []
-        unique_labels = np.unique(mask)
-
-        for label in unique_labels:
-            if label == -1:  # Skip background/noise
-                continue
-
-            # Crea maschera binaria per questo segmento
-            segment_mask = (mask == label)
-
-            # Trova bounding box
-            coords = np.where(segment_mask)
-            if len(coords[0]) == 0:
-                continue
-
-            y_min, y_max = coords[0].min(), coords[0].max()
-            x_min, x_max = coords[1].min(), coords[1].max()
-
-            # Calcola area
-            area = np.sum(segment_mask)
-
-            segment_info = {
-                'id': int(label),
-                'mask': segment_mask,
-                'bbox': [x_min, y_min, x_max, y_max],
-                'area': int(area)
-            }
-
-            segments.append(segment_info)
-
-        return segments
-
-class SemanticSearchPipeline:
-    """
-    Pipeline completa per la segmentazione e ricerca semantica.
+    Classe principale per l'analisi delle scene.
+    Combina SAM per la segmentazione e CLIP per l'identificazione.
     """
 
-    def __init__(self, config_path="config.yaml"):
-        # Carica la configurazione
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Inizializza l'analizzatore di scene.
 
-        # Inizializza i componenti
-        self.clip_model = CLIPBackbone(
-            model_name=self.config['clip']['model_name'],
-            device=self.config['clip']['device']
+        Args:
+            config: Configurazione del progetto
+        """
+        self.config = config
+        self.device = config.get('models', {}).get('clip', {}).get('device', 'cpu')
+
+        # Inizializza SAM
+        sam_config = config.get('models', {}).get('sam', {})
+        self.sam_segmenter = SAMSegmenter(
+            model_type=sam_config.get('model_type', 'vit_b'),
+            checkpoint_path=sam_config.get('checkpoint_path'),
+            device=self.device
         )
 
-        self.indexer = DatasetIndexer(config_path)
-        self.segmenter = ImageSegmenter()
+        # Inizializza CLIP
+        clip_config = config.get('models', {}).get('clip', {})
+        model_name = clip_config.get('model_name', 'openai/clip-vit-base-patch32')
 
-        # Carica l'indice se esiste
-        self.indexer.load_index()
+        if CLIPModel is None or CLIPProcessor is None:
+            raise ImportError("Transformers non installato. Installa con: pip install transformers")
 
-    def extract_segment_features(self, image, mask):
+        self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=True)
+        self.model = CLIPModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+
+        # Carica modello fine-tuned se disponibile
+        checkpoint_path = clip_config.get('checkpoint_path')
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            self.load_finetuned_model(checkpoint_path)
+
+        # Inizializza vector database
+        self.vector_index = None
+        self.metadata = []
+        self.use_faiss = faiss is not None
+
+        # Configurazione ricerca
+        search_config = config.get('search', {})
+        self.top_k = search_config.get('top_k', 5)
+        self.similarity_threshold = search_config.get('similarity_threshold', 0.7)
+
+        # Configurazione segmentazione
+        seg_config = config.get('segmentation', {})
+        self.min_mask_area = seg_config.get('min_mask_area', 1000)
+
+    def load_finetuned_model(self, checkpoint_path: str):
         """
-        Estrae le feature di ogni segmento dell'immagine.
+        Carica un modello CLIP fine-tuned.
+
+        Args:
+            checkpoint_path: Percorso del checkpoint
+        """
+        try:
+            # Fix per PyTorch 2.6+ con TorchScript archives
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✅ Modello CLIP fine-tuned caricato da: {checkpoint_path}")
+        except Exception as e:
+            print(f"⚠️ Errore caricando modello fine-tuned: {e}")
+            print("Usando modello CLIP pre-addestrato")
+
+    def load_vector_database(self, index_path: str, metadata_path: str):
+        """
+        Carica il vector database.
+
+        Args:
+            index_path: Percorso dell'indice vettoriale
+            metadata_path: Percorso dei metadati
+        """
+        try:
+            # Carica metadati
+            with open(metadata_path, 'r') as f:
+                self.metadata = json.load(f)
+
+            # Carica indice
+            if self.use_faiss and index_path.endswith('.faiss') and os.path.exists(index_path):
+                self.vector_index = faiss.read_index(index_path)
+                print(f"✅ Indice FAISS caricato: {self.vector_index.ntotal} vettori")
+            else:
+                # Fallback a array numpy
+                npy_path = index_path.replace('.faiss', '.npy')
+                if os.path.exists(npy_path):
+                    embeddings = np.load(npy_path)
+                    self.vector_index = SimpleVectorDB()
+                    self.vector_index.add(embeddings, self.metadata)
+                    print(f"✅ Vector database caricato: {embeddings.shape[0]} vettori")
+                else:
+                    raise FileNotFoundError(f"Indice non trovato: {index_path} o {npy_path}")
+
+        except Exception as e:
+            print(f"❌ Errore caricando vector database: {e}")
+            self.vector_index = None
+            self.metadata = []
+
+    def compute_image_embedding(self, image: np.ndarray) -> np.ndarray:
+        """
+        Calcola l'embedding di un'immagine usando CLIP.
+
+        Args:
+            image: Immagine come array numpy
+
+        Returns:
+            Embedding normalizzato
+        """
+        try:
+            if isinstance(image, np.ndarray):
+                # Controlla le dimensioni dell'immagine
+                if len(image.shape) == 1:
+                    # Se l'immagine è 1D, non è valida
+                    print(f"⚠️ Immagine 1D non valida, shape: {image.shape}")
+                    return np.zeros(512, dtype=np.float32)  # Restituisci embedding zero
+
+                elif len(image.shape) == 2:
+                    # Immagine grayscale, convertila a RGB
+                    image = np.stack([image, image, image], axis=-1)
+
+                elif len(image.shape) == 3:
+                    # Controlla che abbia canali validi
+                    if image.shape[-1] not in [3, 4]:
+                        print(f"⚠️ Numero di canali non valido: {image.shape[-1]}")
+                        return np.zeros(512, dtype=np.float32)
+
+                    # Converti da array numpy a PIL Image
+                    if image.shape[-1] == 4:  # RGBA
+                        image = Image.fromarray(image.astype(np.uint8), mode='RGBA').convert('RGB')
+                    else:  # RGB
+                        image = Image.fromarray(image.astype(np.uint8), mode='RGB')
+                else:
+                    print(f"⚠️ Dimensioni immagine non supportate: {image.shape}")
+                    return np.zeros(512, dtype=np.float32)
+
+            elif isinstance(image, Image.Image):
+                # Se è già una PIL Image, assicurati che sia RGB
+                image = image.convert('RGB')
+            else:
+                print(f"⚠️ Tipo di immagine non supportato: {type(image)}")
+                return np.zeros(512, dtype=np.float32)
+
+            # Verifica che l'immagine abbia dimensioni minime
+            if hasattr(image, 'size') and (image.size[0] < 10 or image.size[1] < 10):
+                print(f"⚠️ Immagine troppo piccola: {image.size}")
+                return np.zeros(512, dtype=np.float32)
+
+            # Preprocessa l'immagine
+            inputs = self.processor(images=image, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            # Calcola embedding
+            with torch.no_grad():
+                image_features = self.model.get_image_features(**inputs)
+
+                # Controlla che l'output abbia la forma corretta
+                if len(image_features.shape) == 1:
+                    # Se è 1D, aggiungi dimensione batch
+                    image_features = image_features.unsqueeze(0)
+
+                # Normalizza
+                image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+
+            return image_features.cpu().numpy().flatten()
+
+        except Exception as e:
+            print(f"❌ Errore nel calcolo embedding: {e}")
+            print(f"Tipo immagine: {type(image)}")
+            if isinstance(image, np.ndarray):
+                print(f"Shape immagine: {image.shape}")
+            # Restituisci embedding zero come fallback
+            return np.zeros(512, dtype=np.float32)
+
+    def search_similar_characters(self, embedding: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Cerca personaggi simili nel vector database.
+
+        Args:
+            embedding: Embedding dell'immagine query
+
+        Returns:
+            Lista di risultati con similarità e metadati
+        """
+        if self.vector_index is None:
+            return []
+
+        try:
+            if self.use_faiss and hasattr(self.vector_index, 'search'):
+                # Ricerca FAISS
+                embedding = embedding.reshape(1, -1).astype(np.float32)
+                faiss.normalize_L2(embedding)
+
+                scores, indices = self.vector_index.search(embedding, self.top_k)
+                scores = scores[0]
+                indices = indices[0]
+
+                # Filtra risultati validi
+                valid_indices = indices >= 0
+                scores = scores[valid_indices]
+                indices = indices[valid_indices]
+
+            else:
+                # Ricerca lineare
+                scores, indices = self.vector_index.search(embedding, self.top_k)
+
+            # Costruisci risultati
+            results = []
+            for score, idx in zip(scores, indices):
+                if score >= self.similarity_threshold and idx < len(self.metadata):
+                    result = self.metadata[idx].copy()
+                    result['similarity_score'] = float(score)
+                    results.append(result)
+
+            return results
+
+        except Exception as e:
+            print(f"Errore nella ricerca: {e}")
+            return []
+
+    def analyze_scene(self, image: np.ndarray, use_prompts: bool = False,
+                     prompt_points: List[Tuple[int, int]] = None) -> Dict[str, Any]:
+        """
+        Analizza una scena completa identificando tutti i personaggi.
+
+        Args:
+            image: Immagine della scena
+            use_prompts: Se usare punti prompt per la segmentazione
+            prompt_points: Punti per la segmentazione guidata
+
+        Returns:
+            Dizionario con risultati dell'analisi
+        """
+        results = {
+            'original_image': image,
+            'detected_characters': [],
+            'segmentation_masks': [],
+            'annotated_image': None,
+            'analysis_summary': {}
+        }
+
+        try:
+            # 1. Segmentazione con SAM
+            if use_prompts and prompt_points:
+                # Segmentazione guidata
+                mask_data = self.sam_segmenter.segment_with_prompts(image, prompt_points)
+                masks = [mask_data]
+            else:
+                # Segmentazione automatica
+                masks = self.sam_segmenter.segment_automatic(image)
+
+            print(f"Trovate {len(masks)} maschere")
+
+            # 2. Estrazione oggetti
+            extracted_objects = self.sam_segmenter.extract_objects(
+                image, masks, min_area=self.min_mask_area
+            )
+
+            print(f"Estratti {len(extracted_objects)} oggetti validi")
+
+            # 3. Identificazione personaggi
+            for obj in extracted_objects:
+                try:
+                    # Calcola embedding dell'oggetto
+                    obj_embedding = self.compute_image_embedding(obj['image'])
+
+                    # Cerca personaggi simili
+                    similar_chars = self.search_similar_characters(obj_embedding)
+
+                    # Determina il personaggio più probabile
+                    if similar_chars:
+                        best_match = similar_chars[0]
+                        character_name = best_match['character']
+                        confidence = best_match['similarity_score']
+                    else:
+                        character_name = "Sconosciuto"
+                        confidence = 0.0
+
+                    character_info = {
+                        'object_id': obj['object_id'],
+                        'character_name': character_name,
+                        'confidence': confidence,
+                        'bbox': obj['bbox'],
+                        'area': obj['area'],
+                        'segmentation_confidence': obj['confidence'],
+                        'similar_matches': similar_chars[:3]  # Top 3 matches
+                    }
+
+                    results['detected_characters'].append(character_info)
+
+                except Exception as e:
+                    print(f"Errore identificando oggetto {obj['object_id']}: {e}")
+                    continue
+
+            # 4. Salva maschere per visualizzazione
+            results['segmentation_masks'] = masks
+
+            # 5. Crea immagine annotata
+            results['annotated_image'] = self.create_annotated_image(
+                image, results['detected_characters']
+            )
+
+            # 6. Crea riassunto
+            characters_found = [char['character_name'] for char in results['detected_characters']
+                              if char['character_name'] != "Sconosciuto"]
+            unique_characters = list(set(characters_found))
+
+            results['analysis_summary'] = {
+                'total_objects_detected': len(extracted_objects),
+                'characters_identified': len([c for c in results['detected_characters']
+                                            if c['character_name'] != "Sconosciuto"]),
+                'unique_characters': unique_characters,
+                'unknown_objects': len([c for c in results['detected_characters']
+                                      if c['character_name'] == "Sconosciuto"]),
+                'average_confidence': np.mean([c['confidence'] for c in results['detected_characters']])
+                                    if results['detected_characters'] else 0.0
+            }
+
+            print(f"✅ Analisi completata: {len(unique_characters)} personaggi unici identificati")
+
+        except Exception as e:
+            print(f"❌ Errore nell'analisi della scena: {e}")
+            results['error'] = str(e)
+
+        return results
+
+    def create_annotated_image(self, image: np.ndarray,
+                             characters: List[Dict[str, Any]]) -> np.ndarray:
+        """
+        Crea un'immagine annotata con i personaggi identificati.
 
         Args:
             image: Immagine originale
-            mask: Maschera di segmentazione
+            characters: Lista di personaggi identificati
 
         Returns:
-            Lista di feature per ogni segmento
+            Immagine annotata
         """
-        if isinstance(image, Image.Image):
-            image_array = np.array(image)
-        else:
-            image_array = image
+        annotated = image.copy()
 
-        unique_segments = np.unique(mask)
-        segment_features = []
-        segment_info = []
+        # Colori per le annotazioni
+        colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 0, 0), (0, 128, 0)
+        ]
 
-        for segment_id in unique_segments:
-            # Crea maschera per questo segmento
-            segment_mask = (mask == segment_id)
+        for i, char in enumerate(characters):
+            color = colors[i % len(colors)]
+            bbox = char['bbox']
+            name = char['character_name']
+            confidence = char['confidence']
 
-            # Calcola bounding box
-            rows, cols = np.where(segment_mask)
-            if len(rows) == 0:
-                continue
+            # Disegna bounding box
+            cv2.rectangle(annotated, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
 
-            min_row, max_row = rows.min(), rows.max()
-            min_col, max_col = cols.min(), cols.max()
+            # Prepara testo
+            if confidence > 0:
+                label = f"{name} ({confidence:.2f})"
+            else:
+                label = name
 
-            # Estrai il segmento
-            segment_image = image_array[min_row:max_row+1, min_col:max_col+1]
+            # Calcola posizione testo
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
 
-            # Applica la maschera
-            segment_mask_crop = segment_mask[min_row:max_row+1, min_col:max_col+1]
-            segment_image = segment_image * segment_mask_crop[:, :, np.newaxis]
+            # Sfondo per il testo
+            cv2.rectangle(annotated,
+                         (bbox[0], bbox[1] - label_size[1] - 10),
+                         (bbox[0] + label_size[0], bbox[1]),
+                         color, -1)
 
-            # Converte in PIL e preprocessa
-            segment_pil = Image.fromarray(segment_image.astype(np.uint8))
+            # Testo
+            cv2.putText(annotated, label, (bbox[0], bbox[1] - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            try:
-                # Estrai feature con CLIP
-                preprocessed = self.clip_model.preprocess(segment_pil).unsqueeze(0)
-                with torch.no_grad():
-                    features = self.clip_model.encode_image(preprocessed.to(self.clip_model.device))
+        return annotated
 
-                segment_features.append(features.cpu().numpy())
-                segment_info.append({
-                    'segment_id': int(segment_id),
-                    'bbox': (min_col, min_row, max_col, max_row),
-                    'area': int(np.sum(segment_mask))
-                })
-
-            except Exception as e:
-                print(f"Errore nell'estrazione delle feature per il segmento {segment_id}: {e}")
-                continue
-
-        return segment_features, segment_info
-
-    def search_in_segments(self, image_path, query_text, top_k=5,
-                          segmentation_method="grid", **seg_kwargs):
+    def query_database(self, query_image: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
         """
-        Cerca segmenti di un'immagine che corrispondono alla query.
+        Cerca immagini simili nel database usando un'immagine query.
 
         Args:
-            image_path: Percorso dell'immagine
-            query_text: Testo della query
-            top_k: Numero di segmenti da restituire
-            segmentation_method: Metodo di segmentazione
-            **seg_kwargs: Parametri per la segmentazione
+            query_image: Immagine di query
+            top_k: Numero di risultati da restituire
 
         Returns:
-            Lista di risultati con score e informazioni sui segmenti
+            Lista di immagini simili con metadati
         """
-        # Carica l'immagine
-        image = Image.open(image_path).convert('RGB')
+        if self.vector_index is None:
+            return []
 
-        # Segmenta l'immagine
-        self.segmenter.method = segmentation_method
-        segments = self.segmenter.segment(image, **seg_kwargs)
+        try:
+            # Calcola embedding della query
+            query_embedding = self.compute_image_embedding(query_image)
 
-        # Se il metodo non restituisce segmenti nel formato atteso, converti
-        if segments and isinstance(segments[0], dict) and 'bbox' in segments[0]:
-            # Formato già corretto con segmenti
-            segment_info = segments
-            # Crea una maschera dummy per compatibilità
-            mask = np.zeros((image.size[1], image.size[0]), dtype=int)
-        else:
-            # Formato legacy con maschera numerica - converti in segmenti
-            mask = segments if segments is not None else np.zeros((image.size[1], image.size[0]), dtype=int)
-            segment_info = self._convert_mask_to_segments(mask, image.size)
+            # Cerca risultati simili
+            if self.use_faiss and hasattr(self.vector_index, 'search'):
+                # FAISS search
+                query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
+                faiss.normalize_L2(query_embedding)
 
-        # Estrai feature dei segmenti usando il nuovo formato
-        segment_features = []
-        results = []
+                scores, indices = self.vector_index.search(query_embedding, top_k)
+                scores = scores[0]
+                indices = indices[0]
 
-        for i, seg_info in enumerate(segment_info):
-            try:
-                bbox = seg_info['bbox']
-                x1, y1, x2, y2 = bbox
+                # Filtra risultati validi
+                valid_indices = indices >= 0
+                scores = scores[valid_indices]
+                indices = indices[valid_indices]
+            else:
+                # Linear search
+                scores, indices = self.vector_index.search(query_embedding, top_k)
 
-                # Estrai il segmento dell'immagine
-                segment_image = image.crop((x1, y1, x2, y2))
+            # Costruisci risultati
+            results = []
+            for score, idx in zip(scores, indices):
+                if idx < len(self.metadata):
+                    result = self.metadata[idx].copy()
+                    result['similarity_score'] = float(score)
 
-                # Estrai feature con CLIP
-                preprocessed = self.clip_model.preprocess(segment_image).unsqueeze(0)
-                with torch.no_grad():
-                    features = self.clip_model.encode_image(preprocessed.to(self.clip_model.device))
+                    # Carica immagine se esiste
+                    if os.path.exists(result['path']):
+                        result['image'] = np.array(Image.open(result['path']).convert('RGB'))
 
-                segment_features.append(features.cpu().numpy())
+                    results.append(result)
 
-            except Exception as e:
-                print(f"Errore nell'estrazione delle feature per il segmento {i}: {e}")
-                continue
+            return results
 
-        if not segment_features:
-            return [], mask
-
-        # Estrai feature della query
-        query_features = self.clip_model.encode_text([query_text])
-        query_features = query_features.cpu().numpy()
-
-        # Calcola similarità
-        similarities = []
-        for features in segment_features:
-            similarity = np.dot(features.flatten(), query_features.flatten())
-            similarities.append(similarity)
-
-        # Ordina per similarità
-        sorted_indices = np.argsort(similarities)[::-1][:top_k]
-
-        # Prepara i risultati
-        results = []
-        for i, idx in enumerate(sorted_indices):
-            if idx < len(segment_info):
-                result = {
-                    'rank': i + 1,
-                    'similarity': float(similarities[idx]),
-                    'segment_info': segment_info[idx],
-                    'features': segment_features[idx]
-                }
-                results.append(result)
-
-        return results, mask
-
-    def _convert_mask_to_segments(self, mask, image_size):
-        """
-        Converte una maschera numerica in lista di segmenti.
-
-        Args:
-            mask: Maschera con ID dei segmenti
-            image_size: Dimensioni dell'immagine (W, H)
-
-        Returns:
-            Lista di segmenti con informazioni geometriche
-        """
-        segments = []
-        unique_labels = np.unique(mask)
-
-        for label in unique_labels:
-            if label == -1 or label == 0:  # Skip background/noise
-                continue
-
-            # Crea maschera binaria per questo segmento
-            segment_mask = (mask == label)
-
-            # Trova bounding box
-            coords = np.where(segment_mask)
-            if len(coords[0]) == 0:
-                continue
-
-            y_min, y_max = coords[0].min(), coords[0].max()
-            x_min, x_max = coords[1].min(), coords[1].max()
-
-            # Calcola area
-            area = np.sum(segment_mask)
-
-            segment_info = {
-                'id': int(label),
-                'mask': segment_mask,
-                'bbox': [x_min, y_min, x_max, y_max],
-                'area': int(area)
-            }
-
-            segments.append(segment_info)
-
-        return segments
-
-def main():
-    """
-    Funzione principale per testare la pipeline.
-    """
-    pipeline = SemanticSearchPipeline()
-
-    print("Pipeline di segmentazione e ricerca semantica pronta!")
-    print("\nEsempi di utilizzo:")
-    print("1. Ricerca in segmenti:")
-    print("   results, mask = pipeline.search_in_segments('image.jpg', 'blue sky')")
-    print("2. Ricerca nel dataset:")
-    print("   results = pipeline.batch_search_scenes('mountain landscape')")
-
-
-if __name__ == "__main__":
-    main()
+        except Exception as e:
+            print(f"Errore nella query del database: {e}")
+            return []

@@ -1,488 +1,561 @@
 """
-Interfaccia Gradio per il sistema di ricerca semantica delle immagini.
-Questa interfaccia fornisce una demo interattiva delle capacità del sistema CLIP Scene Search.
+Interfaccia utente Gradio per il sistema di Scene Analysis.
 """
 
 import gradio as gr
-import os
-import sys
-import yaml
+import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import io
-from typing import List, Tuple, Optional
+import yaml
+import os
+from typing import List, Dict, Any, Tuple, Optional
+import json
 
-# Importa i moduli del progetto
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+# Import delle pipeline
+from ..pipelines.segment_and_search import SceneAnalyzer
+from ..pipelines.index_dataset import DatasetIndexer
+from ..pipelines.fine_tune_clip import CLIPFineTuner, split_dataset
 
-from src.pipelines.segment_and_search import SemanticSearchPipeline
-from src.pipelines.index_dataset import DatasetIndexer
 
-
-class GradioDemo:
+def convert_numpy_types(obj):
     """
-    Demo Gradio per il sistema di ricerca semantica CLIP.
+    Converte ricorsivamente i tipi numpy in tipi Python nativi per la serializzazione JSON.
+
+    Args:
+        obj: Oggetto da convertire
+
+    Returns:
+        Oggetto con tipi Python nativi
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    else:
+        return obj
+
+
+class GradioApp:
+    """
+    Applicazione Gradio per il sistema di Scene Analysis.
     """
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config_path = config_path
-        self.pipeline = None
-        self.indexer = None
-        self.is_initialized = False
+        """
+        Inizializza l'applicazione Gradio.
 
-    def load_config(self) -> dict:
-        """Carica la configurazione."""
-        try:
-            with open(self.config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            return {}
+        Args:
+            config_path: Percorso del file di configurazione
+        """
+        # Carica configurazione
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
 
-    def initialize_system(self) -> str:
-        """Inizializza il sistema."""
-        if self.is_initialized:
-            return "✅ Sistema già inizializzato!"
+        # Inizializza l'analizzatore di scene
+        self.scene_analyzer = SceneAnalyzer(self.config)
 
-        try:
-            self.pipeline = SemanticSearchPipeline(self.config_path)
-            self.indexer = DatasetIndexer(self.config_path)
+        # Carica il vector database se disponibile
+        vector_db_config = self.config.get('vector_db', {})
+        index_path = vector_db_config.get('index_path', 'data/vector_db/image_index.faiss')
+        metadata_path = vector_db_config.get('metadata_path', 'data/vector_db/image_metadata.json')
 
-            # Prova a caricare l'indice esistente
-            try:
-                self.indexer.load_index()
-                total_images = self.indexer.index.ntotal if self.indexer.index else 0
-                if total_images > 0:
-                    self.is_initialized = True
-                    return f"✅ Sistema inizializzato! Database con {total_images} immagini caricato."
-                else:
-                    raise Exception("Database vuoto")
-            except:
-                # Se non esiste un database, prova ad auto-indicizzare il dataset di Naruto
-                config = self.load_config()
-                raw_data_path = config.get('dataset', {}).get('raw_data_path', 'data/raw/')
-                naruto_path = os.path.join(raw_data_path, 'Anime-Naruto')
+        if os.path.exists(metadata_path):
+            self.scene_analyzer.load_vector_database(index_path, metadata_path)
 
-                if os.path.exists(naruto_path):
-                    try:
-                        # Auto-indicizza il dataset di Naruto
-                        self.indexer.index_dataset(naruto_path)
+        # Configurazione UI
+        ui_config = self.config.get('ui', {})
+        self.title = ui_config.get('title', "Sistema di Scene Analysis - Personaggi Naruto")
+        self.port = ui_config.get('port', 7860)
+        self.share = ui_config.get('share', False)
+        self.debug = ui_config.get('debug', True)
+        self.max_image_size = ui_config.get('max_image_size', 1024)
 
-                        # Ricarica l'indice dopo l'indicizzazione
-                        self.indexer.load_index()
-                        total_images = self.indexer.index.ntotal if self.indexer.index else 0
-                        self.is_initialized = True
-                        return f"✅ Sistema inizializzato! Dataset Naruto auto-indicizzato con {total_images} immagini."
-                    except Exception as e:
-                        self.is_initialized = True
-                        return f"✅ Sistema inizializzato! ⚠️ Errore nell'auto-indicizzazione: {str(e)}"
-                else:
-                    self.is_initialized = True
-                    return "✅ Sistema inizializzato! ⚠️ Nessun dataset trovato - carica manualmente nella tab Indicizzazione."
+    def analyze_scene_interface(self, image: np.ndarray,
+                               use_prompts: bool = False) -> Tuple[np.ndarray, str, str]:
+        """
+        Interfaccia per l'analisi delle scene.
 
-        except Exception as e:
-            return f"❌ Errore nell'inizializzazione: {str(e)}"
+        Args:
+            image: Immagine caricata dall'utente
+            use_prompts: Se usare segmentazione guidata
 
-    def search_images(self, query: str, top_k: int = 5) -> Tuple[str, List]:
-        """Ricerca immagini nel dataset."""
-        if not self.is_initialized:
-            return "❌ Sistema non inizializzato!", []
-
-        if not query.strip():
-            return "⚠️ Inserisci una query di ricerca!", []
-
-        try:
-            results = self.indexer.search_similar_images(query, top_k)
-
-            if not results:
-                return "❌ Nessun risultato trovato. Assicurati che il dataset sia indicizzato.", []
-
-            # Prepara le immagini per Gradio
-            images = []
-            for result in results:
-                img_path = result['metadata']['path']
-                if os.path.exists(img_path):
-                    images.append((img_path, f"Similarità: {result['similarity']:.3f}"))
-                else:
-                    # Crea un placeholder se l'immagine non esiste
-                    placeholder = Image.new('RGB', (224, 224), color='gray')
-                    images.append((placeholder, f"Immagine non trovata - Sim: {result['similarity']:.3f}"))
-
-            return f"✅ Trovati {len(results)} risultati per: '{query}'", images
-
-        except Exception as e:
-            return f"❌ Errore durante la ricerca: {str(e)}", []
-
-    def search_segments(self, image, query: str, method: str = "grid",
-                       grid_size: int = 4, n_clusters: int = 8, n_segments: int = 100) -> Tuple[str, Optional[Image.Image]]:
-        """Ricerca segmenti nell'immagine."""
-        if not self.is_initialized:
-            return "❌ Sistema non inizializzato!", None
-
+        Returns:
+            Tupla con (immagine_annotata, risultati_json, riassunto)
+        """
         if image is None:
-            return "⚠️ Carica un'immagine!", None
-
-        if not query.strip():
-            return "⚠️ Inserisci una query di ricerca!", None
+            return None, "❌ Nessuna immagine caricata", "Carica un'immagine per iniziare l'analisi."
 
         try:
-            # Salva temporaneamente l'immagine
-            temp_path = "temp_gradio_image.jpg"
-            image.save(temp_path)
+            # Ridimensiona immagine se troppo grande
+            if max(image.shape[:2]) > self.max_image_size:
+                scale = self.max_image_size / max(image.shape[:2])
+                new_height = int(image.shape[0] * scale)
+                new_width = int(image.shape[1] * scale)
+                image = np.array(Image.fromarray(image).resize((new_width, new_height)))
 
-            # Prepara i parametri di segmentazione
-            if method == "grid":
-                seg_kwargs = {"grid_size": (grid_size, grid_size)}
-            elif method == "kmeans":
-                seg_kwargs = {"n_clusters": n_clusters}
-            elif method == "sam":
-                seg_kwargs = {}  # SAM non ha parametri configurabili nell'interfaccia
-            else:  # superpixel
-                seg_kwargs = {"n_segments": n_segments}
+            # Analizza la scena
+            results = self.scene_analyzer.analyze_scene(image, use_prompts=use_prompts)
 
-            # Esegui la ricerca nei segmenti
-            results, mask = self.pipeline.search_in_segments(
-                temp_path, query, top_k=3, segmentation_method=method, **seg_kwargs
-            )
+            # Prepara output
+            annotated_image = results.get('annotated_image', image)
+
+            # Crea JSON dei risultati
+            results_for_json = {
+                'detected_characters': results['detected_characters'],
+                'analysis_summary': results['analysis_summary']
+            }
+            results_json = json.dumps(convert_numpy_types(results_for_json), indent=2, ensure_ascii=False)
+
+            # Crea riassunto testuale
+            summary = self._create_analysis_summary(results)
+
+            return annotated_image, results_json, summary
+
+        except Exception as e:
+            error_msg = f"❌ Errore durante l'analisi: {str(e)}"
+            return image, error_msg, error_msg
+
+    def query_database_interface(self, query_image: np.ndarray,
+                                top_k: int = 5) -> Tuple[List[np.ndarray], str]:
+        """
+        Interfaccia per la ricerca nel database.
+
+        Args:
+            query_image: Immagine di query
+            top_k: Numero di risultati da mostrare
+
+        Returns:
+            Tupla con (lista_immagini_simili, risultati_json)
+        """
+        if query_image is None:
+            return [], "❌ Nessuna immagine caricata"
+
+        try:
+            # Cerca immagini simili
+            results = self.scene_analyzer.query_database(query_image, top_k=top_k)
 
             if not results:
-                os.remove(temp_path)
-                return "❌ Nessun segmento rilevante trovato.", None
+                return [], "❌ Nessun risultato trovato o database non caricato"
 
-            # Crea la visualizzazione
-            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-            ax.imshow(image)
-            ax.set_title(f"Segmenti per: '{query}' (Metodo: {method})")
-            ax.axis('off')
+            # Estrai immagini e metadati
+            similar_images = []
+            results_data = []
 
-            # Disegna i bounding box dei segmenti migliori
-            colors = plt.cm.get_cmap('tab10', len(results))
+            for result in results:
+                if 'image' in result:
+                    similar_images.append(result['image'])
 
-            for i, result in enumerate(results):
-                bbox = result['segment_info']['bbox']
-                x, y, x2, y2 = bbox
+                # Prepara metadati per JSON
+                result_data = {
+                    'character': result.get('character', 'Sconosciuto'),
+                    'similarity_score': result.get('similarity_score', 0.0),
+                    'path': result.get('path', ''),
+                    'split': result.get('split', '')
+                }
+                results_data.append(result_data)
 
-                rect = patches.Rectangle((x, y), x2-x, y2-y,
-                                       linewidth=3, edgecolor=colors(i),
-                                       facecolor='none', alpha=0.8)
-                ax.add_patch(rect)
+            # Crea JSON dei risultati
+            results_json = json.dumps({
+                'query_results': results_data,
+                'total_results': len(results_data)
+            }, indent=2, ensure_ascii=False)
 
-                ax.text(x, y-5, f"#{i+1}\n{result['similarity']:.3f}",
-                       fontsize=12, color=colors(i), fontweight='bold',
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
-
-            # Salva la figura
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-            buf.seek(0)
-            result_image = Image.open(buf)
-            plt.close()
-
-            # Pulisci
-            os.remove(temp_path)
-
-            message = f"✅ Trovati {len(results)} segmenti rilevanti!"
-            return message, result_image
+            return similar_images, results_json
 
         except Exception as e:
-            if os.path.exists("temp_gradio_image.jpg"):
-                os.remove("temp_gradio_image.jpg")
-            return f"❌ Errore durante la segmentazione: {str(e)}", None
+            error_msg = f"❌ Errore durante la ricerca: {str(e)}"
+            return [], error_msg
 
-    def index_sample_data(self, data_path: str) -> str:
-        """Indicizza dati di esempio."""
-        if not self.is_initialized:
-            return "❌ Sistema non inizializzato!"
+    def build_index_interface(self, dataset_path: str) -> str:
+        """
+        Interfaccia per costruire l'indice del dataset.
 
-        if not data_path.strip():
-            return "⚠️ Inserisci il percorso della directory!"
+        Args:
+            dataset_path: Percorso del dataset
 
-        if not os.path.exists(data_path):
-            return f"❌ Directory non trovata: {data_path}"
+        Returns:
+            Messaggio di stato
+        """
+        if not dataset_path:
+            return "❌ Inserisci il percorso del dataset"
+
+        if not os.path.exists(dataset_path):
+            return f"❌ Percorso non trovato: {dataset_path}"
 
         try:
-            # Conta le immagini
-            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-            image_files = []
+            # Crea indicizzatore
+            indexer = DatasetIndexer(self.config)
 
-            for root, dirs, files in os.walk(data_path):
-                for file in files:
-                    if any(file.lower().endswith(ext) for ext in image_extensions):
-                        image_files.append(os.path.join(root, file))
+            # Costruisci indice
+            indexer.build_full_index(dataset_path, use_faiss=True)
 
-            if not image_files:
-                return f"❌ Nessuna immagine trovata in: {data_path}"
+            # Ricarica il vector database nell'analizzatore
+            vector_db_config = self.config.get('vector_db', {})
+            index_path = vector_db_config.get('index_path', 'data/vector_db/image_index.faiss')
+            metadata_path = vector_db_config.get('metadata_path', 'data/vector_db/image_metadata.json')
 
-            # Esegui l'indicizzazione
-            self.indexer.index_dataset(data_path)
+            self.scene_analyzer.load_vector_database(index_path, metadata_path)
 
-            return f"✅ Indicizzazione completata! {len(image_files)} immagini elaborate."
+            return "✅ Indice costruito con successo! Il database è ora disponibile per le ricerche."
 
         except Exception as e:
-            return f"❌ Errore durante l'indicizzazione: {str(e)}"
+            return f"❌ Errore durante la costruzione dell'indice: {str(e)}"
 
-    def evaluate_performance(self) -> str:
-        """Esegui valutazione delle performance del sistema."""
-        if not self.is_initialized:
-            return "❌ Sistema non inizializzato!"
+    def finetune_clip_interface(self, dataset_path: str, num_epochs: int = 5) -> str:
+        """
+        Interfaccia per il fine-tuning di CLIP.
+
+        Args:
+            dataset_path: Percorso del dataset
+            num_epochs: Numero di epoche di training
+
+        Returns:
+            Messaggio di stato
+        """
+        if not dataset_path:
+            return "❌ Inserisci il percorso del dataset"
+
+        if not os.path.exists(dataset_path):
+            return f"❌ Percorso non trovato: {dataset_path}"
 
         try:
-            from src.pipelines.performance_evaluation import PerformanceEvaluator
+            # Carica dataset
+            indexer = DatasetIndexer(self.config)
+            dataset = indexer.load_dataset(dataset_path)
 
-            evaluator = PerformanceEvaluator(self.config_path)
+            if len(dataset) == 0:
+                return "❌ Dataset vuoto o non valido"
 
-            # Genera report completo
-            report_path = evaluator.generate_comprehensive_report()
+            # Dividi dataset
+            train_set, val_set, test_set = split_dataset(dataset)
 
-            return f"✅ Valutazione completata!\n📋 Report salvato in: {report_path}\n\n" \
-                   f"Il report include:\n" \
-                   f"• Metriche di ricerca semantica\n" \
-                   f"• Performance dei metodi di segmentazione\n" \
-                   f"• Qualità degli embedding CLIP\n" \
-                   f"• Grafici e raccomandazioni"
+            # Aggiorna configurazione con le epoche richieste
+            self.config['training']['num_epochs'] = num_epochs
+
+            # Crea fine-tuner
+            fine_tuner = CLIPFineTuner(self.config)
+
+            # Avvia training
+            fine_tuner.train(train_set, val_set)
+
+            return f"✅ Fine-tuning completato! Modello salvato in: {fine_tuner.checkpoint_dir}"
 
         except Exception as e:
-            return f"❌ Errore durante la valutazione: {str(e)}"
+            return f"❌ Errore durante il fine-tuning: {str(e)}"
 
-    def create_interface(self) -> gr.Blocks:
-        """Crea l'interfaccia Gradio."""
+    def _create_analysis_summary(self, results: Dict[str, Any]) -> str:
+        """
+        Crea un riassunto testuale dei risultati dell'analisi.
 
+        Args:
+            results: Risultati dell'analisi
+
+        Returns:
+            Riassunto testuale
+        """
+        summary = results.get('analysis_summary', {})
+        characters = results.get('detected_characters', [])
+
+        # Intestazione
+        text = "📊 **RIASSUNTO ANALISI SCENA**\n\n"
+
+        # Statistiche generali
+        text += f"🔍 **Oggetti rilevati:** {summary.get('total_objects_detected', 0)}\n"
+        text += f"👥 **Personaggi identificati:** {summary.get('characters_identified', 0)}\n"
+        text += f"❓ **Oggetti sconosciuti:** {summary.get('unknown_objects', 0)}\n"
+        text += f"📈 **Confidenza media:** {summary.get('average_confidence', 0.0):.2f}\n\n"
+
+        # Personaggi unici trovati
+        unique_chars = summary.get('unique_characters', [])
+        if unique_chars:
+            text += "🎭 **Personaggi riconosciuti:**\n"
+            for char in unique_chars:
+                text += f"  • {char}\n"
+            text += "\n"
+
+        # Dettagli per ogni personaggio identificato
+        if characters:
+            text += "📋 **Dettagli identificazioni:**\n\n"
+            for i, char in enumerate(characters, 1):
+                name = char.get('character_name', 'Sconosciuto')
+                confidence = char.get('confidence', 0.0)
+                area = char.get('area', 0)
+
+                text += f"**{i}. {name}**\n"
+                text += f"   Confidenza: {confidence:.3f}\n"
+                text += f"   Area: {area} pixel\n"
+
+                if confidence > 0.8:
+                    text += "   ✅ Identificazione molto sicura\n"
+                elif confidence > 0.6:
+                    text += "   ⚠️ Identificazione probabile\n"
+                else:
+                    text += "   ❓ Identificazione incerta\n"
+
+                text += "\n"
+
+        return text
+
+    def create_interface(self):
+        """
+        Crea l'interfaccia Gradio completa.
+
+        Returns:
+            Interfaccia Gradio
+        """
         with gr.Blocks(
-            title="🔍 CLIP Scene Search Demo",
+            title=self.title,
             theme=gr.themes.Soft(),
             css="""
-            .gradio-container {
-                max-width: 1200px !important;
-            }
-            .tab-nav button {
-                font-size: 16px !important;
-            }
+            .gradio-container {font-family: 'Arial', sans-serif;}
+            .tab-nav button {font-weight: bold;}
+            .output-image {border-radius: 10px;}
             """
-        ) as demo:
+        ) as interface:
 
-            gr.Markdown("""
-            # 🎯 CLIP Scene Search System Demo
+            # Titolo principale
+            gr.Markdown(f"""
+            # 🎭 {self.title}
             
-            Questo sistema utilizza il modello CLIP per la ricerca semantica avanzata nelle immagini.
-            
-            **Funzionalità disponibili:**
-            - 🔍 **Ricerca Globale**: Trova immagini simili nel dataset usando descrizioni testuali
-            - 🧩 **Ricerca Segmenti**: Analizza parti specifiche di un'immagine
-            - 📊 **Indicizzazione**: Prepara il dataset per la ricerca veloce
+            Sistema di analisi automatica delle scene per l'identificazione dei personaggi di Naruto.
+            Utilizza **SAM** per la segmentazione e **CLIP** per il riconoscimento.
             """)
 
-            # Tab per l'inizializzazione
-            with gr.Tab("🚀 Inizializzazione"):
-                gr.Markdown("### Inizializza il sistema prima di utilizzare le altre funzionalità")
+            with gr.Tabs():
+                # TAB 1: Analisi delle Scene
+                with gr.Tab("🔍 Analisi Scene", id="scene_analysis"):
+                    gr.Markdown("""
+                    ### Carica un'immagine con più personaggi per identificarli automaticamente
+                    Il sistema segmenterà l'immagine e identificherà ogni personaggio presente.
+                    """)
 
-                init_button = gr.Button("🔄 Inizializza Sistema", variant="primary", size="lg")
-                init_output = gr.Textbox(label="Stato Sistema", lines=3)
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            scene_input = gr.Image(
+                                label="Immagine della Scena",
+                                type="numpy",
+                                height=400
+                            )
 
-                init_button.click(
-                    fn=self.initialize_system,
-                    outputs=init_output
-                )
+                            use_prompts = gr.Checkbox(
+                                label="Usa segmentazione guidata (sperimentale)",
+                                value=False
+                            )
 
-            # Tab per la ricerca globale
-            with gr.Tab("🔍 Ricerca Globale"):
-                gr.Markdown("### Cerca immagini simili nel dataset usando descrizioni testuali")
+                            analyze_btn = gr.Button(
+                                "🚀 Analizza Scena",
+                                variant="primary",
+                                size="lg"
+                            )
 
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        search_query = gr.Textbox(
-                            label="Query di Ricerca",
-                            placeholder="es. 'un tramonto sul mare', 'una foresta verde', 'un gatto nero'",
-                            lines=2
+                        with gr.Column(scale=1):
+                            scene_output = gr.Image(
+                                label="Risultato Annotato",
+                                type="numpy",
+                                height=400
+                            )
+
+                    with gr.Row():
+                        with gr.Column():
+                            analysis_summary = gr.Textbox(
+                                label="📊 Riassunto Analisi",
+                                lines=10,
+                                max_lines=15
+                            )
+
+                        with gr.Column():
+                            results_json = gr.Textbox(
+                                label="📋 Risultati Dettagliati (JSON)",
+                                lines=10,
+                                max_lines=15
+                            )
+
+                    # Event handler per analisi scene
+                    analyze_btn.click(
+                        fn=self.analyze_scene_interface,
+                        inputs=[scene_input, use_prompts],
+                        outputs=[scene_output, results_json, analysis_summary]
+                    )
+
+                # TAB 2: Ricerca nel Database
+                with gr.Tab("📚 Ricerca Database", id="database_query"):
+                    gr.Markdown("""
+                    ### Cerca personaggi simili nel database
+                    Carica un'immagine di un personaggio per trovare immagini simili nel database.
+                    """)
+
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            query_input = gr.Image(
+                                label="Immagine Query",
+                                type="numpy",
+                                height=300
+                            )
+
+                            top_k_slider = gr.Slider(
+                                minimum=1,
+                                maximum=20,
+                                value=5,
+                                step=1,
+                                label="Numero di risultati da mostrare"
+                            )
+
+                            search_btn = gr.Button(
+                                "🔎 Cerca Simili",
+                                variant="primary"
+                            )
+
+                        with gr.Column(scale=2):
+                            search_results = gr.Gallery(
+                                label="Risultati Simili",
+                                columns=3,
+                                rows=2,
+                                height=400
+                            )
+
+                    search_results_json = gr.Textbox(
+                        label="📋 Dettagli Risultati",
+                        lines=8,
+                        max_lines=10
+                    )
+
+                    # Event handler per ricerca database
+                    search_btn.click(
+                        fn=self.query_database_interface,
+                        inputs=[query_input, top_k_slider],
+                        outputs=[search_results, search_results_json]
+                    )
+
+                # TAB 3: Gestione Sistema
+                with gr.Tab("⚙️ Gestione Sistema", id="system_management"):
+                    gr.Markdown("""
+                    ### Configurazione e manutenzione del sistema
+                    Funzioni per costruire l'indice del dataset e fare fine-tuning del modello.
+                    """)
+
+                    with gr.Accordion("🏗️ Costruzione Indice Dataset", open=False):
+                        gr.Markdown("""
+                        Costruisci l'indice vettoriale dal dataset di immagini.
+                        **Nota:** Questa operazione può richiedere diversi minuti.
+                        """)
+
+                        dataset_path_input = gr.Textbox(
+                            label="Percorso Dataset",
+                            placeholder="data/raw/Anime-Naruto",
+                            value="data/raw/Anime-Naruto"
                         )
-                        search_top_k = gr.Slider(
-                            minimum=1, maximum=10, value=5, step=1,
-                            label="Numero di risultati"
-                        )
-                        search_button = gr.Button("🔍 Cerca", variant="primary")
 
-                    with gr.Column(scale=1):
-                        search_status = gr.Textbox(label="Stato", lines=3)
-
-                search_gallery = gr.Gallery(
-                    label="Risultati della Ricerca",
-                    show_label=True,
-                    elem_id="search_gallery",
-                    columns=3,
-                    rows=2,
-                    object_fit="contain",
-                    height="auto"
-                )
-
-                search_button.click(
-                    fn=self.search_images,
-                    inputs=[search_query, search_top_k],
-                    outputs=[search_status, search_gallery]
-                )
-
-            # Tab per la ricerca nei segmenti
-            with gr.Tab("🧩 Ricerca Segmenti"):
-                gr.Markdown("### Carica un'immagine e cerca parti specifiche al suo interno")
-
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        segment_image = gr.Image(
-                            label="Carica Immagine",
-                            type="pil",
-                            height=300
+                        build_index_btn = gr.Button(
+                            "🏗️ Costruisci Indice",
+                            variant="secondary"
                         )
 
-                        segment_query = gr.Textbox(
-                            label="Cosa stai cercando?",
-                            placeholder="es. 'volto di una persona', 'cielo blu', 'edificio'",
-                            lines=2
+                        index_status = gr.Textbox(
+                            label="Stato Costruzione",
+                            lines=3
                         )
 
-                        segment_method = gr.Dropdown(
-                            choices=["grid", "kmeans", "superpixel", "sam"],
-                            value="grid",
-                            label="Metodo di Segmentazione",
-                            info="SAM fornisce la segmentazione più accurata ma richiede più tempo"
+                        build_index_btn.click(
+                            fn=self.build_index_interface,
+                            inputs=[dataset_path_input],
+                            outputs=[index_status]
                         )
 
-                        with gr.Accordion("⚙️ Parametri Avanzati", open=False):
-                            grid_size = gr.Slider(2, 8, 4, step=1, label="Dimensione Griglia")
-                            n_clusters = gr.Slider(4, 16, 8, step=1, label="Numero Cluster K-means")
-                            n_segments = gr.Slider(50, 200, 100, step=10, label="Numero Superpixel")
+                    with gr.Accordion("🎯 Fine-tuning CLIP", open=False):
+                        gr.Markdown("""
+                        Esegui il fine-tuning del modello CLIP sui personaggi di Naruto.
+                        **Attenzione:** Questa operazione è molto intensiva e può richiedere ore.
+                        """)
 
-                        segment_button = gr.Button("🔍 Analizza Segmenti", variant="primary")
+                        finetune_dataset_path = gr.Textbox(
+                            label="Percorso Dataset per Fine-tuning",
+                            placeholder="data/raw/Anime-Naruto",
+                            value="data/raw/Anime-Naruto"
+                        )
 
-                    with gr.Column(scale=2):
-                        segment_status = gr.Textbox(label="Stato", lines=2)
-                        segment_result = gr.Image(label="Risultati Segmentazione", height=400)
+                        epochs_slider = gr.Slider(
+                            minimum=1,
+                            maximum=20,
+                            value=5,
+                            step=1,
+                            label="Numero di Epoche"
+                        )
 
-                segment_button.click(
-                    fn=self.search_segments,
-                    inputs=[segment_image, segment_query, segment_method,
-                           grid_size, n_clusters, n_segments],
-                    outputs=[segment_status, segment_result]
-                )
+                        finetune_btn = gr.Button(
+                            "🎯 Avvia Fine-tuning",
+                            variant="secondary"
+                        )
 
-            # Tab per l'indicizzazione
-            with gr.Tab("📊 Indicizzazione"):
-                gr.Markdown("### Aggiungi nuove immagini al database per la ricerca")
+                        finetune_status = gr.Textbox(
+                            label="Stato Fine-tuning",
+                            lines=3
+                        )
 
-                index_path = gr.Textbox(
-                    label="Percorso Directory Immagini",
-                    placeholder="es. data/raw/nuovo_dataset/",
-                    value="data/raw/Anime-Naruto/"
-                )
+                        finetune_btn.click(
+                            fn=self.finetune_clip_interface,
+                            inputs=[finetune_dataset_path, epochs_slider],
+                            outputs=[finetune_status]
+                        )
 
-                index_button = gr.Button("📥 Indicizza Dataset", variant="primary")
-                index_status = gr.Textbox(label="Stato Indicizzazione", lines=4)
+                    with gr.Accordion("ℹ️ Informazioni Sistema", open=True):
+                        system_info = self._get_system_info()
+                        gr.Markdown(system_info)
 
-                index_button.click(
-                    fn=self.index_sample_data,
-                    inputs=index_path,
-                    outputs=index_status
-                )
+            # Footer
+            gr.Markdown("""
+            ---
+            *Sistema di Scene Analysis - Progetto Deep Learning*  
+            Tecnologie: SAM, CLIP, FAISS, Gradio
+            """)
 
-            # Nuovo Tab per la valutazione delle performance
-            with gr.Tab("📈 Valutazione Performance"):
-                gr.Markdown("""
-                ### Valutazione quantitativa del sistema
-                
-                Questo strumento esegue una valutazione completa delle performance del sistema:
-                - **Accuratezza ricerca semantica**: Precision, Recall, F1-Score, MAP
-                - **Performance segmentazione**: Tempi di elaborazione, qualità dei segmenti
-                - **Qualità embedding**: Coerenza intra/inter-classe
-                """)
+        return interface
 
-                eval_button = gr.Button("🚀 Esegui Valutazione Completa", variant="primary", size="lg")
-                eval_status = gr.Textbox(
-                    label="Risultati Valutazione",
-                    lines=10,
-                    placeholder="I risultati della valutazione appariranno qui..."
-                )
+    def _get_system_info(self) -> str:
+        """
+        Ottiene informazioni di stato del sistema.
 
-                eval_button.click(
-                    fn=self.evaluate_performance,
-                    outputs=eval_status
-                )
+        Returns:
+            Informazioni formattate
+        """
+        info = "### 📊 Stato del Sistema\n\n"
 
-            # Tab informazioni aggiornato
-            with gr.Tab("ℹ️ Informazioni"):
-                gr.Markdown("""
-                ## 🎯 CLIP Scene Search System
-                
-                ### Caratteristiche Principali
-                
-                **🔍 Ricerca Semantica Avanzata**
-                - Utilizza il modello CLIP per comprendere il contenuto delle immagini
-                - Ricerca tramite descrizioni in linguaggio naturale
-                - Database vettoriale FAISS per ricerche veloci
-                
-                **🧩 Segmentazione Multi-Metodo**
-                - **Grid**: Divisione uniforme dell'immagine in regioni
-                - **K-means**: Clustering basato sui colori
-                - **Superpixel**: Regioni semanticamente coerenti (SLIC)
-                - **SAM**: Segmentazione automatica avanzata (Segment Anything Model)
-                
-                **📊 Valutazione Performance**
-                - Metriche quantitative di accuratezza
-                - Analisi comparative dei metodi di segmentazione
-                - Report dettagliati con visualizzazioni
-                
-                ### Obiettivi del Progetto ✅
-                
-                ✅ **Dataset preprocessing**: Acquisizione e preprocessamento dataset caratteri  
-                ✅ **Indexing pipeline**: Creazione database vettoriale con embedding CLIP  
-                ✅ **Scene analysis**: Segmentazione immagini con multipli algoritmi (+SAM)  
-                ✅ **Matching algorithm**: Confronto embedding per identificazione caratteri  
-                ✅ **Interactive interface**: Interfaccia web Gradio completa  
-                ✅ **Performance evaluation**: Sistema di valutazione quantitativa e qualitativa  
-                
-                ### Esempi di Query
-                
-                **Ricerca Globale:**
-                - "personaggio con capelli biondi"
-                - "ninja con fascia sulla fronte"
-                - "personaggio con occhi rossi"
-                - "scena di combattimento"
-                
-                **Ricerca Segmenti:**
-                - "volto del personaggio"
-                - "simbolo sulla fronte"
-                - "vestiti colorati"
-                - "sfondo naturale"
-                
-                ### Supporto Tecnico
-                
-                - **Modello**: CLIP ViT-B/32
-                - **Database**: FAISS IndexFlatIP
-                - **Segmentazione**: Grid, K-means, SLIC, SAM
-                - **Interfaccia**: Gradio con tema personalizzato
-                """)
+        # Controlla vector database
+        if self.scene_analyzer.vector_index is not None:
+            db_size = len(self.scene_analyzer.metadata)
+            info += f"✅ **Vector Database:** Caricato ({db_size} immagini)\n"
+        else:
+            info += "❌ **Vector Database:** Non caricato\n"
 
-        return demo
+        # Controlla modello CLIP
+        info += f"✅ **Modello CLIP:** Caricato\n"
+        info += f"🖥️ **Device:** {self.scene_analyzer.device}\n"
 
+        # Configurazione
+        info += f"🔧 **Soglia similarità:** {self.scene_analyzer.similarity_threshold}\n"
+        info += f"📏 **Top-K ricerca:** {self.scene_analyzer.top_k}\n"
 
-def create_demo(config_path: str = "config.yaml") -> gr.Blocks:
-    """Crea e restituisce la demo Gradio."""
-    demo_app = GradioDemo(config_path)
-    return demo_app.create_interface()
+        return info
 
+    def launch(self):
+        """
+        Avvia l'applicazione Gradio.
+        """
+        interface = self.create_interface()
 
-def main():
-    """Avvia la demo Gradio."""
-    print("🚀 Avvio CLIP Scene Search Demo (Gradio)...")
+        print(f"🚀 Avvio applicazione Gradio...")
+        print(f"📱 Porta: {self.port}")
+        print(f"🌐 Condivisione: {self.share}")
 
-    demo = create_demo()
-
-    # Configurazione del server
-    demo.launch(
-        server_name="0.0.0.0",  # Accessibile da rete locale
-        server_port=7860,       # Porta standard Gradio
-        share=False,            # Cambia a True per condivisione pubblica
-        debug=True,
-        show_error=True,
-        inbrowser=True          # Apre automaticamente nel browser
-    )
-
-
-if __name__ == "__main__":
-    main()
+        interface.launch(
+            server_port=self.port,
+            share=self.share,
+            debug=self.debug,
+            show_error=True
+        )
